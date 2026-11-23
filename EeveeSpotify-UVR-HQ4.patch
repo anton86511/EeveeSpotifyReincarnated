@@ -341,10 +341,10 @@ index 0ac57b2..5584fba 100644
  
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
 new file mode 100644
-index 0000000..2ca7387
+index 0000000..d41680b
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,175 @@
 +import Combine
 +import CoreML
 +import EeveeSpotifyC
@@ -358,18 +358,24 @@ index 0000000..2ca7387
 +
 +    var body: some View {
 +        List {
-+            Section(footer: Text("instrumental_buffer_help".localized)) {
++            Section(footer: Text(player.mode.help.localized)) {
++                Picker("instrumental_mode".localized, selection: $player.mode) {
++                    ForEach(InstrumentalMode.allCases, id: \.self) { mode in
++                        Text(mode.title.localized).tag(mode)
++                    }
++                }
++                .disabled(player.enabled || player.busy)
 +                Toggle("instrumental_title".localized, isOn: Binding(
 +                    get: { player.enabled },
 +                    set: player.setEnabled
 +                ))
-+                .disabled(player.modelURL == nil || player.busy)
++                .disabled(player.busy || (!player.enabled && player.mode == .hq4 && player.modelURL == nil))
 +                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
 +                    Text(player.status.localized)
 +                        .foregroundColor(.secondary)
 +                }
 +            }
-+            if !player.hasBundledModel {
++            if player.mode == .hq4 && !player.hasBundledModel {
 +                Button("instrumental_import".localized) { choosingModel = true }
 +                    .disabled(player.enabled || player.busy)
 +            }
@@ -383,16 +389,44 @@ index 0000000..2ca7387
 +    }
 +}
 +
++private enum InstrumentalMode: String, CaseIterable {
++    case immediate, hq4
++
++    var title: String { self == .immediate ? "instrumental_mode_immediate" : "instrumental_mode_hq4" }
++    var help: String { self == .immediate ? "instrumental_immediate_help" : "instrumental_buffer_help" }
++}
++
++@available(iOS 16.0, *)
++func restoreLiveInstrumentalAtLaunch() {
++    LiveInstrumentalSettings.shared.restore()
++}
++
 +@available(iOS 16.0, *)
 +private final class LiveInstrumentalSettings: ObservableObject {
 +    // Keep the playback effect active when the user closes settings.
 +    static let shared = LiveInstrumentalSettings()
 +    private let worker = LiveInstrumentalWorker()
++    private let defaults = UserDefaults.standard
++    private static let modeKey = "eevee.liveInstrumental.mode"
++    private let enabledKey = "eevee.liveInstrumental.enabled"
++    @Published var mode: InstrumentalMode {
++        didSet {
++            message = nil
++            defaults.set(mode.rawValue, forKey: Self.modeKey)
++        }
++    }
 +    @Published private(set) var enabled = false
 +    @Published private(set) var busy = false
 +    @Published private var message: String?
 +
-+    private init() {}
++    private init() {
++        mode = InstrumentalMode(rawValue: UserDefaults.standard.string(forKey: Self.modeKey) ?? "") ?? .immediate
++    }
++
++    func restore() {
++        guard defaults.bool(forKey: enabledKey), EeveeInstrumentalAvailable() else { return }
++        setEnabled(true)
++    }
 +    var hasBundledModel: Bool { bundledModel != nil }
 +
 +    private var bundledModel: URL? {
@@ -412,13 +446,14 @@ index 0000000..2ca7387
 +    var status: String {
 +        if let message = message { return message }
 +        if busy { return "instrumental_loading" }
-+        if modelURL == nil { return "instrumental_needs_model" }
++        if mode == .hq4 && modelURL == nil { return "instrumental_needs_model" }
 +        if !enabled { return "instrumental_off" }
 +        switch EeveeInstrumentalStatus() {
 +        case 2: return "instrumental_playing"
 +        case 3: return "instrumental_dry"
 +        case 4: return "instrumental_unsupported_audio"
-+        default: return "instrumental_waiting"
++        case 5: return "instrumental_immediate_playing"
++        default: return mode == .immediate ? "instrumental_immediate_waiting" : "instrumental_waiting"
 +        }
 +    }
 +
@@ -427,6 +462,13 @@ index 0000000..2ca7387
 +        if !enable {
 +            worker.stop()
 +            enabled = false
++            defaults.set(false, forKey: enabledKey)
++            return
++        }
++        if mode == .immediate {
++            enabled = EeveeInstrumentalEnableImmediate()
++            defaults.set(enabled, forKey: enabledKey)
++            if !enabled { message = "instrumental_unsupported_audio" }
 +            return
 +        }
 +        guard let modelURL = modelURL else { return }
@@ -435,6 +477,7 @@ index 0000000..2ca7387
 +            DispatchQueue.main.async {
 +                self.busy = false
 +                self.enabled = started
++                self.defaults.set(started, forKey: self.enabledKey)
 +                if !started { self.message = "instrumental_model_error" }
 +            }
 +        } onFailure: {
@@ -695,12 +738,27 @@ index 25a39f4..59407ed 100644
          SettingsGroup(key: "settings_group_looks", entries: [
              SettingsEntry(key: "appearance", icon: "drop.fill", color: Color(hex: "#30B0C7")) { AnyView(AppearanceSettingsView()) },
              SettingsEntry(key: "customization", icon: "paintpalette.fill", color: Color(hex: "#64D2FF")) { AnyView(EeveeUISettingsView()) },
+diff --git a/Sources/EeveeSpotify/Tweak.x.swift b/Sources/EeveeSpotify/Tweak.x.swift
+index cbd1c5b..df907b2 100644
+--- a/Sources/EeveeSpotify/Tweak.x.swift
++++ b/Sources/EeveeSpotify/Tweak.x.swift
+@@ -222,6 +222,10 @@ struct EeveeSpotify: Tweak {
+             return
+         }
+ 
++        if #available(iOS 16.0, *) {
++            DispatchQueue.main.async { restoreLiveInstrumentalAtLaunch() }
++        }
++
+         // Local-only premium force; independent of patching, so premium UI survives everything else being off.
+         activateEeveePremiumForce()
+ 
 diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.m b/Sources/EeveeSpotifyC/LiveInstrumental.m
 new file mode 100644
-index 0000000..ed0044b
+index 0000000..c3f6832
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/LiveInstrumental.m
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,253 @@
 +#include "include/LiveInstrumental.h"
 +#include <AudioToolbox/AudioToolbox.h>
 +#include <dlfcn.h>
@@ -727,7 +785,8 @@ index 0000000..ed0044b
 +static WetFrame outputRing[RING_SIZE];
 +static _Atomic uint64_t inputWrite, inputRead, inputStart, outputWrite, outputRead;
 +static _Atomic uint32_t request, active, inputReady, rate, status;
-+static atomic_bool enabled;
++typedef enum { EffectOff, EffectHQ4, EffectImmediate } EffectMode;
++static _Atomic EffectMode effectMode;
 +static atomic_bool playing = true;
 +// Multiple AudioUnits can call concurrently. Only the first supported active
 +// source is admitted. Both ring producers and consumers have a single owner.
@@ -736,6 +795,7 @@ index 0000000..ed0044b
 +static uint64_t sourceTime, position;
 +static _Atomic uint64_t switchAfterTicks;
 +static float wetGain;
++static float centerLow, centerHigh, centerLowAlpha, centerHighAlpha;
 +static uint32_t renderGeneration, renderRate;
 +
 +static SetPCMCallback resolveObserver(void) {
@@ -744,8 +804,9 @@ index 0000000..ed0044b
 +
 +static void render(const void *identity, const AudioStreamBasicDescription *format,
 +                   AudioBufferList *buffers, UInt32 count) {
-+    if (!atomic_load_explicit(&enabled, memory_order_acquire) ||
-+        !atomic_load_explicit(&playing, memory_order_relaxed) || !count) return;
++    const EffectMode mode = atomic_load_explicit(&effectMode, memory_order_acquire);
++    if (mode == EffectOff || !count ||
++        (mode == EffectHQ4 && !atomic_load_explicit(&playing, memory_order_relaxed))) return;
 +    if (atomic_flag_test_and_set_explicit(&rendering, memory_order_acquire)) return;
 +
 +    const uint64_t now = mach_absolute_time();
@@ -786,6 +847,9 @@ index 0000000..ed0044b
 +        renderRate = (uint32_t)format->mSampleRate;
 +        position = 0;
 +        wetGain = 0;
++        centerLow = centerHigh = 0;
++        centerLowAlpha = 1 - expf(-6.2831853f * 160 / renderRate);
++        centerHighAlpha = 1 - expf(-6.2831853f * 7000 / renderRate);
 +        read = atomic_load_explicit(&outputWrite, memory_order_acquire);
 +        atomic_store_explicit(&outputRead, read, memory_order_release);
 +        atomic_store_explicit(&inputStart, write, memory_order_relaxed);
@@ -794,10 +858,11 @@ index 0000000..ed0044b
 +    }
 +    source = identity;
 +    sourceTime = now;
-+    if (atomic_load_explicit(&inputReady, memory_order_acquire) != generation) goto done;
++    const bool immediate = mode == EffectImmediate;
++    if (!immediate && atomic_load_explicit(&inputReady, memory_order_acquire) != generation) goto done;
 +
 +    const uint64_t consumed = atomic_load_explicit(&inputRead, memory_order_acquire);
-+    if (write + count - consumed > RING_SIZE) {
++    if (!immediate && write + count - consumed > RING_SIZE) {
 +        // The worker fell behind by a full ring. Restart in passthrough on the next callback.
 +        atomic_fetch_add(&request, 1);
 +        atomic_store(&status, 3);
@@ -805,7 +870,7 @@ index 0000000..ed0044b
 +    }
 +    const uint64_t outputEnd = atomic_load_explicit(&outputWrite, memory_order_acquire);
 +    const uint64_t delay = (uint64_t)renderRate * DELAY_SECONDS;
-+    uint32_t result = position < delay ? 1 : 2;
++    uint32_t result = immediate ? 5 : position < delay ? 1 : 2;
 +    const unsigned stride = planar ? 1 : 2;
 +    void *left = buffers->mBuffers[0].mData;
 +    void *right = planar ? buffers->mBuffers[1].mData : left;
@@ -816,10 +881,20 @@ index 0000000..ed0044b
 +        else frame = (EeveeStereoFrame){ ((int16_t *)left)[l] / 32768.0f, ((int16_t *)right)[r] / 32768.0f };
 +        if (!isfinite(frame.left)) frame.left = 0;
 +        if (!isfinite(frame.right)) frame.right = 0;
++        EeveeStereoFrame output = {0, 0};
++        if (immediate) {
++            // Attenuate the center in the vocal band while retaining stereo side, bass and highs.
++            const float center = 0.5f * (frame.left + frame.right);
++            centerLow += centerLowAlpha * (center - centerLow);
++            centerHigh += centerHighAlpha * (center - centerHigh);
++            wetGain = fminf(1, wetGain + 1.0f / 256);
++            const float reduction = (centerHigh - centerLow) * wetGain;
++            output = (EeveeStereoFrame){frame.left - reduction, frame.right - reduction};
++            goto writeOutput;
++        }
++
 +        inputRing[write & RING_MASK] = frame;
 +        dryDelay[position & RING_MASK] = frame;
-+
-+        EeveeStereoFrame output = {0, 0};
 +        if (position >= delay) {
 +            const uint64_t due = position - delay;
 +            output = dryDelay[due & RING_MASK];
@@ -850,8 +925,10 @@ index 0000000..ed0044b
 +            ((int16_t *)right)[r] = (int16_t)(output.right >= 1 ? 32767 : output.right <= -1 ? -32768 : output.right * 32768);
 +        }
 +    }
-+    atomic_store_explicit(&inputWrite, write, memory_order_release);
-+    atomic_store_explicit(&outputRead, read, memory_order_release);
++    if (!immediate) {
++        atomic_store_explicit(&inputWrite, write, memory_order_release);
++        atomic_store_explicit(&outputRead, read, memory_order_release);
++    }
 +    atomic_store_explicit(&status, result, memory_order_relaxed);
 +done:
 +    atomic_flag_clear_explicit(&rendering, memory_order_release);
@@ -859,7 +936,7 @@ index 0000000..ed0044b
 +
 +bool EeveeInstrumentalAvailable(void) { return resolveObserver() != NULL; }
 +
-+bool EeveeInstrumentalEnable(void) {
++static bool enableEffect(EffectMode mode) {
 +    SetPCMCallback set = resolveObserver();
 +    if (!set) return false;
 +    mach_timebase_info_data_t timebase;
@@ -867,19 +944,23 @@ index 0000000..ed0044b
 +    atomic_store(&switchAfterTicks, UINT64_C(350000000) * timebase.denom / timebase.numer);
 +    atomic_fetch_add(&request, 1);
 +    atomic_store(&status, 1);
-+    atomic_store_explicit(&enabled, true, memory_order_release);
++    atomic_store_explicit(&effectMode, mode, memory_order_release);
 +    set(render);
 +    return true;
 +}
 +
++bool EeveeInstrumentalEnable(void) { return enableEffect(EffectHQ4); }
++
++bool EeveeInstrumentalEnableImmediate(void) { return enableEffect(EffectImmediate); }
++
 +void EeveeInstrumentalDisable(void) {
-+    atomic_store_explicit(&enabled, false, memory_order_release);
++    atomic_store_explicit(&effectMode, EffectOff, memory_order_release);
 +    SetPCMCallback set = resolveObserver();
 +    if (set) set(NULL);
 +}
 +
 +void EeveeInstrumentalReset(void) {
-+    if (!atomic_load(&enabled)) return;
++    if (atomic_load(&effectMode) == EffectOff) return;
 +    atomic_fetch_add(&request, 1);
 +    atomic_store(&status, 1);
 +}
@@ -889,14 +970,14 @@ index 0000000..ed0044b
 +}
 +
 +uint32_t EeveeInstrumentalDelayMs(void) {
-+    if (!atomic_load(&enabled) || atomic_load(&request) != atomic_load(&active)) return 0;
++    if (atomic_load(&effectMode) != EffectHQ4 || atomic_load(&request) != atomic_load(&active)) return 0;
 +    const uint32_t mode = atomic_load(&status);
 +    return mode >= 1 && mode <= 3 ? DELAY_SECONDS * 1000 : 0;
 +}
 +
 +EeveeInstrumentalStream EeveeInstrumentalCurrentStream(void) {
 +    uint32_t generation = atomic_load_explicit(&active, memory_order_acquire);
-+    if (!atomic_load(&enabled) || generation != atomic_load(&request)) return (EeveeInstrumentalStream){0, 0};
++    if (atomic_load(&effectMode) != EffectHQ4 || generation != atomic_load(&request)) return (EeveeInstrumentalStream){0, 0};
 +    return (EeveeInstrumentalStream){generation, atomic_load(&rate)};
 +}
 +
@@ -933,10 +1014,10 @@ index 0000000..ed0044b
 +}
 diff --git a/Sources/EeveeSpotifyC/include/LiveInstrumental.h b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
 new file mode 100644
-index 0000000..c4d058f
+index 0000000..c079f1b
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +#pragma once
 +#include <stdbool.h>
 +#include <stdint.h>
@@ -953,6 +1034,7 @@ index 0000000..c4d058f
 +
 +bool EeveeInstrumentalAvailable(void);
 +bool EeveeInstrumentalEnable(void);
++bool EeveeInstrumentalEnableImmediate(void);
 +void EeveeInstrumentalDisable(void);
 +void EeveeInstrumentalReset(void);
 +void EeveeInstrumentalSetPlaying(bool playing);
@@ -964,10 +1046,10 @@ index 0000000..c4d058f
 +uint32_t EeveeInstrumentalStatus(void);
 diff --git a/Tests/LiveInstrumentalStream.c b/Tests/LiveInstrumentalStream.c
 new file mode 100644
-index 0000000..22151c4
+index 0000000..73f2fbc
 --- /dev/null
 +++ b/Tests/LiveInstrumentalStream.c
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,109 @@
 +#include <assert.h>
 +#include <stdio.h>
 +#include "../Sources/EeveeSpotifyC/LiveInstrumental.m"
@@ -992,7 +1074,7 @@ index 0000000..22151c4
 +
 +int main(void) {
 +    atomic_store(&request, 1);
-+    atomic_store(&enabled, true);
++    atomic_store(&effectMode, EffectHQ4);
 +    for (unsigned i = 0; i < Frames; ++i) instrumental[i] = (EeveeStereoFrame){0.25f, 0.3f};
 +
 +    play(0.5f);
@@ -1038,17 +1120,54 @@ index 0000000..22151c4
 +    assert(samples[0] == 0.4f && EeveeInstrumentalStatus() == 4);
 +    assert(EeveeInstrumentalDelayMs() == 0);
 +
-+    puts("PASS: aligned wet and dry playback, pause, seek reset and unsupported format");
++    format.mSampleRate = 48000;
++    atomic_store(&effectMode, EffectImmediate);
++    EeveeInstrumentalReset();
++    EeveeInstrumentalSetPlaying(false);
++    play(0.5f);
++    assert(samples[0] > 0.49f);
++    assert(EeveeInstrumentalStatus() == 5 && EeveeInstrumentalDelayMs() == 0);
++    assert(EeveeInstrumentalCurrentStream().generation == 0);
++
++    EeveeInstrumentalReset();
++    double inputEnergy = 0, outputEnergy = 0;
++    for (unsigned block = 0; block < 32; ++block) {
++        for (unsigned i = 0; i < Frames; ++i) {
++            float sample = 0.5f * sinf(6.2831853f * 1000 * (block * Frames + i) / 48000);
++            samples[2 * i] = samples[2 * i + 1] = sample;
++            if (block > 1) inputEnergy += sample * sample;
++        }
++        render(&unit, &format, &buffer, Frames);
++        if (block > 1) {
++            for (unsigned i = 0; i < Frames; ++i) outputEnergy += samples[2 * i] * samples[2 * i];
++        }
++    }
++    assert(outputEnergy < inputEnergy * 0.15);
++
++    EeveeInstrumentalReset();
++    for (unsigned i = 0; i < Frames; ++i) {
++        samples[2 * i] = 0.5f;
++        samples[2 * i + 1] = -0.5f;
++    }
++    render(&unit, &format, &buffer, Frames);
++    for (unsigned i = 0; i < Frames; ++i) {
++        assert(samples[2 * i] == 0.5f && samples[2 * i + 1] == -0.5f);
++    }
++
++    EeveeInstrumentalDisable();
++    play(0.6f);
++    assert(samples[0] == 0.6f);
++    puts("PASS: buffered playback, immediate vocal-band attenuation, stereo preservation and bypass");
 +}
 diff --git a/Tools/LiveInstrumental.md b/Tools/LiveInstrumental.md
 new file mode 100644
-index 0000000..66396e1
+index 0000000..2b6bb33
 --- /dev/null
 +++ b/Tools/LiveInstrumental.md
 @@ -0,0 +1,7 @@
-+# 即時去人聲 · UVR Inst HQ 4
++# 播放去人聲
 +
-+此功能需要 iOS 16 以上，以及包含新版 Pixie 音訊模組的 EeveeSpotify IPA。相容的 Spotify 建置版本由 Pixie 封裝流程決定，目前為 9.2.0 與 9.2.2。開啟 **EeveeSpotify 設定 → 即時去人聲 · UVR Inst HQ 4**，匯入 `InstHQ4.mlpackage`，再打開開關。使用 GitHub Actions 的 **Build IPA (PATCHED)** 時，可勾選 **uvr_hq4** 隨 IPA 內建模型，安裝後可直接開啟。
++此功能需要 iOS 16 以上，以及包含新版 Pixie 音訊模組的 EeveeSpotify IPA。相容的 Spotify 建置版本由 Pixie 封裝流程決定，目前為 9.2.0 與 9.2.2。開啟 **EeveeSpotify 設定 → 播放去人聲**，選擇處理模式再打開開關。即時模式無額外緩衝，會抑制置於立體聲中央的人聲與樂器，部分人聲可能保留。AI 模式需要 HQ 4 模型。離開設定頁後，效果持續作用於這支 iPhone 上的播放。App 會記住模式與開關。使用 GitHub Actions 的 **Build IPA (PATCHED)** 時，可勾選 **uvr_hq4** 隨 IPA 內建模型，安裝後可直接開啟。
 +
 +在已安裝 Xcode 與 Python 3.12 的 Mac 上執行 `bash Tools/prepare-hq4-model.sh /path/to/output`。轉換程式會驗證 HQ 4 權重的 SHA-256、Core ML 輸入輸出格式，以及轉換後的輸出與 ONNX 模型的一致性。可將產生的 `InstHQ4.mlpackage` 傳至 iPhone 後從「檔案」匯入。也可在簽署 IPA 前將 `InstHQ4.mlmodelc` 放在 `Payload/Spotify.app/`，使 app 開啟時自動找到模型。模型轉換沿用 [Music-MelBand-iOS](https://github.com/anton86511/Music-MelBand-iOS/tree/15902924b33122a1f9ba9d3c9f622850666d529e) 的流程。
 +
@@ -1169,15 +1288,21 @@ index 0000000..4ad01e9
 +test -d "$work/InstHQ4.mlmodelc"
 +mv "$work/InstHQ4.mlpackage" "$work/InstHQ4.mlmodelc" "$output/"
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings
-index 7bfc293..b21aa35 100644
+index 7bfc293..5211d76 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
-@@ -518,3 +518,16 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
+@@ -518,3 +518,22 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
  restart_later = "Later";
  manage_downloads = "Manage downloads";
  manage_downloads_subtitle = "Pixie offline downloads";
 +
-+"instrumental_title" = "Live Vocal Removal · UVR Inst HQ 4";
++"instrumental_title" = "Live Vocal Reduction";
++"instrumental_mode" = "Mode";
++"instrumental_mode_immediate" = "Immediate vocal reduction";
++"instrumental_mode_hq4" = "AI separation · UVR Inst HQ 4";
++"instrumental_immediate_help" = "Applies as audio plays with no added buffer. Centered instruments may also be reduced, and some vocals may remain.";
++"instrumental_immediate_playing" = "Applying immediate vocal reduction";
++"instrumental_immediate_waiting" = "Waiting for audio…";
 +"instrumental_buffer_help" = "Playback on this iPhone uses an 8-second buffer. Turning the effect off returns to Spotify’s current playback position.";
 +"instrumental_import" = "Import InstHQ4.mlpackage";
 +"instrumental_loading" = "Loading the model…";
@@ -1190,15 +1315,21 @@ index 7bfc293..b21aa35 100644
 +"instrumental_model_error" = "Could not load the HQ 4 Core ML model.";
 +"instrumental_processing_error" = "Vocal removal stopped after a model error. Original audio has resumed.";
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings
-index 6309ef0..a1bdf34 100644
+index 6309ef0..ba735ef 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
-@@ -516,3 +516,16 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
+@@ -516,3 +516,22 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
  glass_lyrics_view = "自定義歌詞檢視";
  lyrics_source_restart_popup = "請重新啟動 Spotify，讓新的歌詞來源在所有位置生效。在此之前，已播放過的歌曲會保留舊歌詞。";
  restart_later = "稍後";
 +
-+"instrumental_title" = "即時去人聲 · UVR Inst HQ 4";
++"instrumental_title" = "播放去人聲";
++"instrumental_mode" = "處理模式";
++"instrumental_mode_immediate" = "即時人聲抑制";
++"instrumental_mode_hq4" = "AI 去人聲 · UVR Inst HQ 4";
++"instrumental_immediate_help" = "隨播放處理，無額外緩衝。置中的樂器也可能變小聲，部分人聲可能保留。";
++"instrumental_immediate_playing" = "正在即時抑制人聲";
++"instrumental_immediate_waiting" = "正在等待播放音訊…";
 +"instrumental_buffer_help" = "在這支 iPhone 播放時會緩衝約 8 秒。關閉去人聲後，會回到 Spotify 目前的播放位置。";
 +"instrumental_import" = "匯入 InstHQ4.mlpackage";
 +"instrumental_loading" = "正在載入模型…";
