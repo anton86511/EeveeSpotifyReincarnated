@@ -12,6 +12,11 @@ on:
         default: ""
         required: false
         type: string
+      uvr_hq4:
+        description: "Include UVR Inst HQ 4 for live vocal removal (iOS 16+, Spotify 9.2.0/9.2.2)"
+        default: false
+        required: false
+        type: boolean
       upload_method:
         description: "Where to upload the built IPA"
         default: "artifacts"
@@ -36,6 +41,12 @@ jobs:
           ref: ${{ inputs.branch }}
           fetch-depth: 0
           submodules: recursive
+
+      - name: Apply the HQ 4 source patch
+        if: ${{ inputs.uvr_hq4 }}
+        run: |
+          git apply --check EeveeSpotify-UVR-HQ4.patch
+          git apply EeveeSpotify-UVR-HQ4.patch
 
       - uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -91,9 +102,12 @@ jobs:
 
       - name: Validate vanilla IPA
         if: ${{ inputs.ipa_url != '' }}
+        env:
+          SOURCE_IPA_URL: ${{ inputs.ipa_url }}
         run: |
-          wget "${{ inputs.ipa_url }}" --no-verbose -O ${{ github.workspace }}/spotify.ipa
-          file_type=$(file --mime-type -b ${{ github.workspace }}/spotify.ipa)
+          curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
+            --output "$GITHUB_WORKSPACE/spotify.ipa" -- "$SOURCE_IPA_URL"
+          file_type=$(file --mime-type -b "$GITHUB_WORKSPACE/spotify.ipa")
           if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
             echo "::error::Not a valid IPA: $file_type"
             exit 1
@@ -177,6 +191,28 @@ jobs:
           unzip -l "$OUT_IPA" | grep SpotifyAudioProbe.dylib \
               || { echo "::error::SpotifyAudioProbe.dylib missing from IPA"; exit 1; }
           echo "Pixie companion bundled: Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib"
+
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.ipa_url != '' && inputs.uvr_hq4 }}
+        with:
+          python-version: '3.12'
+
+      - name: Bundle UVR Inst HQ 4
+        if: ${{ inputs.ipa_url != '' && inputs.uvr_hq4 }}
+        run: |
+          set -euo pipefail
+          if ! unzip -Z1 "$OUT_IPA" | grep -Fx 'Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib' >/dev/null; then
+            echo "::error::UVR HQ 4 requires the Pixie audio companion for Spotify 9.2.0 or 9.2.2."
+            exit 1
+          fi
+          model_dir="$(mktemp -d)"
+          trap 'rm -rf "$model_dir"' EXIT
+          bash Tools/prepare-hq4-model.sh "$model_dir"
+          mkdir -p "$model_dir/Payload/Spotify.app"
+          mv "$model_dir/InstHQ4.mlmodelc" "$model_dir/Payload/Spotify.app/"
+          ipa_path="$(pwd)/$OUT_IPA"
+          (cd "$model_dir" && zip -qry "$ipa_path" Payload/Spotify.app/InstHQ4.mlmodelc)
+          unzip -tq "$OUT_IPA"
 
       - name: Inject OpeninSafariSpotify extension into IPA PlugIns
         if: ${{ inputs.ipa_url != '' }}
