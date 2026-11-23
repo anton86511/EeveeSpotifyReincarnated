@@ -52,10 +52,10 @@ index b8971ae..9fa8acc 100644
      bool backendReady;
 diff --git a/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
 new file mode 100644
-index 0000000..82a376f
+index 0000000..c97361b
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,250 @@
 +import Accelerate
 +import CoreML
 +
@@ -71,15 +71,44 @@ index 0000000..82a376f
 +    static let hop = 235_200
 +
 +    private let spectrum: Spectrogram
-+    private let model: SpectrogramCoreML
++    private let url: URL
++    private let cpuModel: SpectrogramCoreML
++    private var gpuModel: SpectrogramCoreML?
++    private var failedGPUEpoch: UInt?
 +
 +    init(url: URL) throws {
++        self.url = url
 +        spectrum = try Spectrogram(size: 5_120, bins: 2_560, hop: 1_024, frames: 256, outputGain: 1)
-+        model = try SpectrogramCoreML(url: url, bins: spectrum.bins, frames: spectrum.frames)
++        cpuModel = try SpectrogramCoreML(url: url, bins: spectrum.bins, frames: spectrum.frames,
++                                        computeUnits: .cpuOnly)
 +    }
 +
-+    func separate(_ audio: [[Float]]) throws -> [[Float]] {
-+        try spectrum.reconstruct(model.predict(spectrum.analyze(audio)))
++    func separate(_ audio: [[Float]], gpuEpoch: () -> UInt?) throws -> [[Float]] {
++        let mix = spectrum.analyze(audio)
++        let prediction: [Float]
++        if let result = predictOnGPU(mix, gpuEpoch: gpuEpoch) {
++            prediction = result
++        } else {
++            prediction = try cpuModel.predict(mix)
++        }
++        return try spectrum.reconstruct(prediction)
++    }
++
++    private func predictOnGPU(_ mix: [Float], gpuEpoch: () -> UInt?) -> [Float]? {
++        guard let epoch = gpuEpoch(), epoch != failedGPUEpoch else { return nil }
++        do {
++            if gpuModel == nil {
++                gpuModel = try SpectrogramCoreML(url: url, bins: spectrum.bins, frames: spectrum.frames,
++                                                computeUnits: .cpuAndGPU)
++            }
++            guard gpuEpoch() == epoch else { return nil }
++            return try gpuModel?.predict(mix)
++        } catch {
++            // A prediction already in flight can lose access to the GPU at lock.
++            failedGPUEpoch = epoch
++            gpuModel = nil
++            return nil
++        }
 +    }
 +}
 +
@@ -100,14 +129,14 @@ index 0000000..82a376f
 +    private let bins: Int
 +    private let frames: Int
 +
-+    init(url: URL, bins: Int, frames: Int) throws {
++    init(url: URL, bins: Int, frames: Int, computeUnits: MLComputeUnits) throws {
 +        let shape = [1, 4, bins, frames]
 +        self.shape = shape
 +        self.bins = bins
 +        self.frames = frames
 +        self.contiguous = [4 * bins * frames, bins * frames, frames, 1]
 +        let configuration = MLModelConfiguration()
-+        configuration.computeUnits = .cpuAndGPU
++        configuration.computeUnits = computeUnits
 +        model = try MLModel(contentsOf: url, configuration: configuration)
 +        guard let source = model.modelDescription.inputDescriptionsByName["input"]?.multiArrayConstraint,
 +              let result = model.modelDescription.outputDescriptionsByName["output"]?.multiArrayConstraint,
@@ -510,10 +539,10 @@ index 0ac57b2..5584fba 100644
  
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
 new file mode 100644
-index 0000000..865e163
+index 0000000..2dd966a
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,175 @@
 +import Combine
 +import CoreML
 +import EeveeSpotifyC
@@ -654,11 +683,6 @@ index 0000000..865e163
 +                self.defaults.set(started, forKey: self.enabledKey)
 +                if !started { self.message = "instrumental_model_error" }
 +            }
-+        } onFailure: {
-+            DispatchQueue.main.async {
-+                self.enabled = false
-+                self.message = "instrumental_processing_error"
-+            }
 +        }
 +    }
 +
@@ -696,12 +720,13 @@ index 0000000..865e163
 +}
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
 new file mode 100644
-index 0000000..3c392f7
+index 0000000..f4572d7
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,231 @@
 +import EeveeSpotifyC
 +import Foundation
++import UIKit
 +
 +@available(iOS 16.0, *)
 +final class LiveInstrumentalWorker {
@@ -710,8 +735,13 @@ index 0000000..3c392f7
 +    private var model: HQ4InstrumentalModel?
 +    private var stream: HQ4Stream?
 +    private var generation: UInt32 = 0
++    private let activityLock = NSLock()
++    private var foregroundEpoch: UInt?
++    private var activityEpoch: UInt = 0
++    private var activityObservers: [NSObjectProtocol] = []
 +
-+    func start(url: URL, completion: @escaping (Bool) -> Void, onFailure: @escaping () -> Void) {
++    func start(url: URL, completion: @escaping (Bool) -> Void) {
++        observeAppActivity()
 +        queue.async {
 +            do {
 +                let model = try HQ4InstrumentalModel(url: url)
@@ -726,13 +756,7 @@ index 0000000..3c392f7
 +                timer.schedule(deadline: .now(), repeating: .milliseconds(35), leeway: .milliseconds(5))
 +                timer.setEventHandler { [weak self] in
 +                    guard let self = self else { return }
-+                    do {
-+                        try autoreleasepool { try self.process() }
-+                    } catch {
-+                        EeveeInstrumentalDisable()
-+                        self.stopOnQueue()
-+                        onFailure()
-+                    }
++                    autoreleasepool { self.process() }
 +                }
 +                self.timer = timer
 +                timer.resume()
@@ -742,6 +766,44 @@ index 0000000..3c392f7
 +                completion(false)
 +            }
 +        }
++    }
++
++    private func observeAppActivity() {
++        guard activityObservers.isEmpty else { return }
++        let center = NotificationCenter.default
++        activityObservers = [
++            center.addObserver(forName: UIApplication.willResignActiveNotification,
++                               object: nil, queue: .main) { [weak self] _ in
++                self?.setForeground(false)
++            },
++            center.addObserver(forName: UIApplication.didEnterBackgroundNotification,
++                               object: nil, queue: .main) { [weak self] _ in
++                self?.setForeground(false)
++            },
++            center.addObserver(forName: UIApplication.didBecomeActiveNotification,
++                               object: nil, queue: .main) { [weak self] _ in
++                self?.setForeground(true)
++            }
++        ]
++        setForeground(UIApplication.shared.applicationState == .active)
++    }
++
++    deinit {
++        for observer in activityObservers { NotificationCenter.default.removeObserver(observer) }
++    }
++
++    private func setForeground(_ active: Bool) {
++        activityLock.lock()
++        activityEpoch &+= 1
++        foregroundEpoch = active ? activityEpoch : nil
++        activityLock.unlock()
++        EeveeInstrumentalSetAppActive(active)
++    }
++
++    private func currentGPUEpoch() -> UInt? {
++        activityLock.lock()
++        defer { activityLock.unlock() }
++        return foregroundEpoch
 +    }
 +
 +    func stop() {
@@ -756,7 +818,7 @@ index 0000000..3c392f7
 +        model = nil
 +    }
 +
-+    private func process() throws {
++    private func process() {
 +        let source = EeveeInstrumentalCurrentStream()
 +        guard source.generation != 0, let model = model else { return }
 +        if source.generation != generation {
@@ -764,8 +826,9 @@ index 0000000..3c392f7
 +            generation = source.generation
 +        }
 +        let thermal = ProcessInfo.processInfo.thermalState
-+        try stream?.process(generation: generation, model: model,
-+                            useModel: thermal != .serious && thermal != .critical)
++        stream?.process(generation: generation, useModel: thermal != .serious && thermal != .critical) { audio in
++            return try? model.separate(audio, gpuEpoch: self.currentGPUEpoch)
++        }
 +    }
 +}
 +
@@ -791,7 +854,7 @@ index 0000000..3c392f7
 +        input = Array(repeating: EeveeStereoFrame(left: 0, right: 0), count: frameCount)
 +    }
 +
-+    func process(generation: UInt32, model: HQ4InstrumentalModel, useModel: Bool) throws {
++    func process(generation: UInt32, useModel: Bool, separate: ([[Float]]) -> [[Float]]?) {
 +        if written < output.count {
 +            flush(generation)
 +            return
@@ -803,9 +866,14 @@ index 0000000..3c392f7
 +        count += Int(appended)
 +        guard count == frameCount else { return }
 +
++        let stems: [[Float]]?
 +        if useModel {
 +            let frames = toModel.convert(input, count: HQ4InstrumentalModel.window)
-+            let stems = try model.separate([frames.map(\.left), frames.map(\.right)])
++            stems = separate([frames.map(\.left), frames.map(\.right)])
++        } else {
++            stems = nil
++        }
++        if let stems {
 +            let wet = zip(stems[0], stems[1]).map { EeveeStereoFrame(left: $0.0, right: $0.1) }
 +            output = fromModel.convert(wet, count: frameCount)
 +        } else {
@@ -818,11 +886,11 @@ index 0000000..3c392f7
 +            output[i].left = pending[i].left * (1 - mix) + output[i].left * mix
 +            output[i].right = pending[i].right * (1 - mix) + output[i].right * mix
 +        }
-+        if useModel {
++        if stems != nil {
 +            pending = Array(output[hop...])
 +            output.removeLast(overlap)
 +        } else {
-+            // Leave this range empty so the render thread reports dry playback.
++            // Leave this range empty so the render thread uses center attenuation.
 +            // Keep the overlapping original frames for a clean return to the model.
 +            pending = Array(input[hop...])
 +            output.removeAll(keepingCapacity: true)
@@ -830,7 +898,7 @@ index 0000000..3c392f7
 +        input.replaceSubrange(0..<overlap, with: Array(input[hop...]))
 +        count = overlap
 +        written = 0
-+        if useModel { flush(generation) }
++        if stems != nil { flush(generation) }
 +        else { position += UInt64(hop) }
 +    }
 +
@@ -929,10 +997,10 @@ index cbd1c5b..df907b2 100644
  
 diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.m b/Sources/EeveeSpotifyC/LiveInstrumental.m
 new file mode 100644
-index 0000000..c3f6832
+index 0000000..b0ecc25
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/LiveInstrumental.m
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,263 @@
 +#include "include/LiveInstrumental.h"
 +#include <AudioToolbox/AudioToolbox.h>
 +#include <dlfcn.h>
@@ -962,6 +1030,7 @@ index 0000000..c3f6832
 +typedef enum { EffectOff, EffectHQ4, EffectImmediate } EffectMode;
 +static _Atomic EffectMode effectMode;
 +static atomic_bool playing = true;
++static atomic_bool appActive = true;
 +// Multiple AudioUnits can call concurrently. Only the first supported active
 +// source is admitted. Both ring producers and consumers have a single owner.
 +static atomic_flag rendering = ATOMIC_FLAG_INIT;
@@ -969,6 +1038,7 @@ index 0000000..c3f6832
 +static uint64_t sourceTime, position;
 +static _Atomic uint64_t switchAfterTicks;
 +static float wetGain;
++static float centerGain;
 +static float centerLow, centerHigh, centerLowAlpha, centerHighAlpha;
 +static uint32_t renderGeneration, renderRate;
 +
@@ -976,11 +1046,21 @@ index 0000000..c3f6832
 +    return (SetPCMCallback)dlsym(RTLD_DEFAULT, "SpotifyAudioProbeSetInstrumentalObserver");
 +}
 +
++static EeveeStereoFrame attenuateCenter(EeveeStereoFrame frame) {
++    const float center = 0.5f * (frame.left + frame.right);
++    centerLow += centerLowAlpha * (center - centerLow);
++    centerHigh += centerHighAlpha * (center - centerHigh);
++    centerGain = fminf(1, centerGain + 1.0f / 256);
++    const float reduction = (centerHigh - centerLow) * centerGain;
++    return (EeveeStereoFrame){frame.left - reduction, frame.right - reduction};
++}
++
 +static void render(const void *identity, const AudioStreamBasicDescription *format,
 +                   AudioBufferList *buffers, UInt32 count) {
 +    const EffectMode mode = atomic_load_explicit(&effectMode, memory_order_acquire);
 +    if (mode == EffectOff || !count ||
-+        (mode == EffectHQ4 && !atomic_load_explicit(&playing, memory_order_relaxed))) return;
++        (mode == EffectHQ4 && atomic_load_explicit(&appActive, memory_order_relaxed) &&
++         !atomic_load_explicit(&playing, memory_order_relaxed))) return;
 +    if (atomic_flag_test_and_set_explicit(&rendering, memory_order_acquire)) return;
 +
 +    const uint64_t now = mach_absolute_time();
@@ -1020,7 +1100,7 @@ index 0000000..c3f6832
 +        renderGeneration = generation;
 +        renderRate = (uint32_t)format->mSampleRate;
 +        position = 0;
-+        wetGain = 0;
++        wetGain = centerGain = 0;
 +        centerLow = centerHigh = 0;
 +        centerLowAlpha = 1 - expf(-6.2831853f * 160 / renderRate);
 +        centerHighAlpha = 1 - expf(-6.2831853f * 7000 / renderRate);
@@ -1057,13 +1137,7 @@ index 0000000..c3f6832
 +        if (!isfinite(frame.right)) frame.right = 0;
 +        EeveeStereoFrame output = {0, 0};
 +        if (immediate) {
-+            // Attenuate the center in the vocal band while retaining stereo side, bass and highs.
-+            const float center = 0.5f * (frame.left + frame.right);
-+            centerLow += centerLowAlpha * (center - centerLow);
-+            centerHigh += centerHighAlpha * (center - centerHigh);
-+            wetGain = fminf(1, wetGain + 1.0f / 256);
-+            const float reduction = (centerHigh - centerLow) * wetGain;
-+            output = (EeveeStereoFrame){frame.left - reduction, frame.right - reduction};
++            output = attenuateCenter(frame);
 +            goto writeOutput;
 +        }
 +
@@ -1071,7 +1145,7 @@ index 0000000..c3f6832
 +        dryDelay[position & RING_MASK] = frame;
 +        if (position >= delay) {
 +            const uint64_t due = position - delay;
-+            output = dryDelay[due & RING_MASK];
++            output = attenuateCenter(dryDelay[due & RING_MASK]);
 +            while (read < outputEnd) {
 +                const WetFrame *wet = &outputRing[read & RING_MASK];
 +                if (wet->generation != generation || wet->position < due) {
@@ -1143,6 +1217,10 @@ index 0000000..c3f6832
 +    atomic_store_explicit(&playing, isPlaying, memory_order_relaxed);
 +}
 +
++void EeveeInstrumentalSetAppActive(bool isActive) {
++    atomic_store_explicit(&appActive, isActive, memory_order_relaxed);
++}
++
 +uint32_t EeveeInstrumentalDelayMs(void) {
 +    if (atomic_load(&effectMode) != EffectHQ4 || atomic_load(&request) != atomic_load(&active)) return 0;
 +    const uint32_t mode = atomic_load(&status);
@@ -1188,10 +1266,10 @@ index 0000000..c3f6832
 +}
 diff --git a/Sources/EeveeSpotifyC/include/LiveInstrumental.h b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
 new file mode 100644
-index 0000000..c079f1b
+index 0000000..9ad3ba7
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,27 @@
 +#pragma once
 +#include <stdbool.h>
 +#include <stdint.h>
@@ -1212,6 +1290,7 @@ index 0000000..c079f1b
 +void EeveeInstrumentalDisable(void);
 +void EeveeInstrumentalReset(void);
 +void EeveeInstrumentalSetPlaying(bool playing);
++void EeveeInstrumentalSetAppActive(bool active);
 +uint32_t EeveeInstrumentalDelayMs(void);
 +EeveeInstrumentalStream EeveeInstrumentalCurrentStream(void);
 +uint32_t EeveeInstrumentalRead(uint32_t generation, EeveeStereoFrame *output, uint32_t count);
@@ -1220,10 +1299,10 @@ index 0000000..c079f1b
 +uint32_t EeveeInstrumentalStatus(void);
 diff --git a/Tests/LiveInstrumentalStream.c b/Tests/LiveInstrumentalStream.c
 new file mode 100644
-index 0000000..73f2fbc
+index 0000000..18138d4
 --- /dev/null
 +++ b/Tests/LiveInstrumentalStream.c
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,114 @@
 +#include <assert.h>
 +#include <stdio.h>
 +#include "../Sources/EeveeSpotifyC/LiveInstrumental.m"
@@ -1271,13 +1350,18 @@ index 0000000..73f2fbc
 +    EeveeInstrumentalSetPlaying(false);
 +    play(0.7f);
 +    assert(samples[0] == 0.7f);
-+    EeveeInstrumentalSetPlaying(true);
++    // A stale player-state callback must not bypass the effect while locked
++    // if the audio unit is still rendering.
++    EeveeInstrumentalSetAppActive(false);
 +    play(0.9f);
 +    assert(samples[(Frames - 1) * 2] == 0.25f);
 +    assert(fabsf(samples[Frames * 2 - 1] - 0.3f) < 0.00001f);
 +    assert(EeveeInstrumentalStatus() == 2);
 +    play(0.9f);
-+    assert(samples[0] == 0.8f && EeveeInstrumentalStatus() == 3);
++    assert(samples[0] < 0.79f && EeveeInstrumentalStatus() == 3);
++    assert(EeveeInstrumentalDelayMs() == 8000);
++    EeveeInstrumentalSetPlaying(true);
++    EeveeInstrumentalSetAppActive(true);
 +
 +    EeveeInstrumentalReset();
 +    assert(EeveeInstrumentalWrite(1, instrumental, Frames, 0) == 0);
@@ -1335,7 +1419,7 @@ index 0000000..73f2fbc
 +}
 diff --git a/Tools/LiveInstrumental.md b/Tools/LiveInstrumental.md
 new file mode 100644
-index 0000000..0844d5c
+index 0000000..91b70f0
 --- /dev/null
 +++ b/Tools/LiveInstrumental.md
 @@ -0,0 +1,9 @@
@@ -1347,7 +1431,7 @@ index 0000000..0844d5c
 +
 +在已安裝 Xcode 與 Python 3.12 的 Mac 上執行 `bash Tools/prepare-hq4-model.sh /path/to/output`。轉換程式會驗證 HQ 4 權重的 SHA-256、Core ML 輸入輸出格式，以及轉換後的輸出與 ONNX 模型的一致性。可將產生的 `InstHQ4.mlpackage` 傳至 iPhone 後從「檔案」匯入。也可在簽署 IPA 前將 `InstHQ4.mlmodelc` 放在 `Payload/Spotify.app/`，使 app 開啟時自動找到模型。模型轉換沿用 [Music-MelBand-iOS](https://github.com/anton86511/Music-MelBand-iOS/tree/15902924b33122a1f9ba9d3c9f622850666d529e) 的流程。
 +
-+HQ 4 以約 5.9 秒的視窗推論，播放保留約 8 秒緩衝。切歌或拖動進度會重新緩衝，切換前仍在緩衝區內的尾段會被清掉。關閉去人聲會回到播放器當前進度。推論錯過播放時限或裝置過熱時，會播出同一位置的緩衝原聲。Core ML 可使用 CPU 和 GPU，實際運算分配由 iOS 決定。支援此裝置上 44.1 kHz 或 48 kHz 的立體聲 PCM。
++HQ 4 以約 5.9 秒的視窗推論，播放保留約 8 秒緩衝。切歌或拖動進度會重新緩衝，切換前仍在緩衝區內的尾段會被清掉。關閉去人聲會回到播放器當前進度。App 在前景時可用 GPU 進行 Core ML 推論。鎖屏或切到背景時，由 CPU 繼續處理同一段音訊。推論暫時失敗、錯過播放時限或裝置過熱時，會先對同一位置的緩衝音訊進行中央人聲抑制，直到 AI 伴奏可用。支援此裝置上 44.1 kHz 或 48 kHz 的立體聲 PCM。
 diff --git a/Tools/prepare-hq4-model.py b/Tools/prepare-hq4-model.py
 new file mode 100644
 index 0000000..12f6416
@@ -1464,10 +1548,10 @@ index 0000000..4ad01e9
 +test -d "$work/InstHQ4.mlmodelc"
 +mv "$work/InstHQ4.mlpackage" "$work/InstHQ4.mlmodelc" "$output/"
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings
-index 7bfc293..02424e3 100644
+index 7bfc293..a3a546c 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
-@@ -518,3 +518,24 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
+@@ -518,3 +518,23 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
  restart_later = "Later";
  manage_downloads = "Manage downloads";
  manage_downloads_subtitle = "Pixie offline downloads";
@@ -1479,24 +1563,23 @@ index 7bfc293..02424e3 100644
 +"instrumental_immediate_help" = "Applies as audio plays with no added buffer. Centered instruments may also be reduced, and some vocals may remain.";
 +"instrumental_immediate_playing" = "Applying immediate vocal reduction";
 +"instrumental_immediate_waiting" = "Waiting for audio…";
-+"instrumental_buffer_help" = "Playback on this iPhone uses an 8-second buffer. Turning the effect off returns to Spotify’s current playback position.";
++"instrumental_buffer_help" = "Playback on this iPhone uses an 8-second buffer. Turning the effect off returns to Spotify’s current playback position. AI processing uses the CPU while locked or in the background. Center vocal reduction covers gaps in AI output.";
 +"instrumental_import" = "Import InstHQ4.mlpackage";
 +"instrumental_loading" = "Loading the model…";
 +"instrumental_needs_model" = "Import a Core ML InstHQ4.mlpackage to enable live vocal removal.";
 +"instrumental_off" = "Original audio";
 +"instrumental_playing" = "Playing instrumental";
-+"instrumental_dry" = "Playing buffered original audio while the model catches up or the iPhone cools down.";
++"instrumental_dry" = "Using center vocal reduction while AI processing catches up.";
 +"instrumental_waiting" = "Waiting for audio or filling the playback buffer…";
 +"instrumental_unsupported_audio" = "This audio format cannot be processed. Playing original audio.";
 +"instrumental_model_error" = "Could not load the HQ 4 Core ML model.";
-+"instrumental_processing_error" = "Vocal removal stopped after a model error. Original audio has resumed.";
 +"instrumental_switch_on" = "On";
 +"instrumental_switch_off" = "Off";
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings
-index 6309ef0..2ce2e36 100644
+index 6309ef0..40111b2 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
-@@ -516,3 +516,24 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
+@@ -516,3 +516,23 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
  glass_lyrics_view = "自定義歌詞檢視";
  lyrics_source_restart_popup = "請重新啟動 Spotify，讓新的歌詞來源在所有位置生效。在此之前，已播放過的歌曲會保留舊歌詞。";
  restart_later = "稍後";
@@ -1508,16 +1591,15 @@ index 6309ef0..2ce2e36 100644
 +"instrumental_immediate_help" = "隨播放處理，無額外緩衝。置中的樂器也可能變小聲，部分人聲可能保留。";
 +"instrumental_immediate_playing" = "正在即時抑制人聲";
 +"instrumental_immediate_waiting" = "正在等待播放音訊…";
-+"instrumental_buffer_help" = "在這支 iPhone 播放時會緩衝約 8 秒。關閉去人聲後，會回到 Spotify 目前的播放位置。";
++"instrumental_buffer_help" = "在這支 iPhone 播放時會緩衝約 8 秒。關閉去人聲後，會回到 Spotify 目前的播放位置。 鎖屏或切到背景時會改用 CPU 執行 AI。模型暫時跟不上時會切到人聲抑制。";
 +"instrumental_import" = "匯入 InstHQ4.mlpackage";
 +"instrumental_loading" = "正在載入模型…";
 +"instrumental_needs_model" = "請先匯入 Core ML 格式的 InstHQ4.mlpackage。";
 +"instrumental_off" = "原始音訊";
 +"instrumental_playing" = "正在播放去人聲伴奏";
-+"instrumental_dry" = "暫時播放緩衝的原聲，等待模型完成處理或 iPhone 降溫。";
++"instrumental_dry" = "AI 正在追上播放進度，暫時使用人聲抑制。";
 +"instrumental_waiting" = "正在等待播放音訊或填滿緩衝區…";
 +"instrumental_unsupported_audio" = "目前的音訊格式無法處理，正在播放原聲。";
 +"instrumental_model_error" = "無法載入 HQ 4 Core ML 模型。";
-+"instrumental_processing_error" = "模型處理失敗，已恢復播放原聲。";
 +"instrumental_switch_on" = "開啟";
 +"instrumental_switch_off" = "關閉";
