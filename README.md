@@ -10,6 +10,10 @@ This tweak makes Spotify think you have a Premium subscription, granting free li
 > [!NOTE]
 > The original EeveeSpotify repository was disabled due to a [DMCA takedown](https://github.com/github/dmca/blob/master/2025/08/2025-08-14-spotify.md). This repository will not contain IPA packages in the repo itself.
 
+## Live Vocal Removal
+
+UVR Inst HQ 4 is available as an experimental playback effect on iOS 16 and later with the updated Pixie audio companion. See the [model and setup instructions](Tools/LiveInstrumental.md).
+
 ## Custom Lyrics Support
 
 **Spotify 9.1.56 and above** - Full custom lyrics functionality is available with the following providers:
