@@ -695,11 +695,11 @@ index 25a39f4..59407ed 100644
          SettingsGroup(key: "settings_group_looks", entries: [
              SettingsEntry(key: "appearance", icon: "drop.fill", color: Color(hex: "#30B0C7")) { AnyView(AppearanceSettingsView()) },
              SettingsEntry(key: "customization", icon: "paintpalette.fill", color: Color(hex: "#64D2FF")) { AnyView(EeveeUISettingsView()) },
-diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.c b/Sources/EeveeSpotifyC/LiveInstrumental.c
+diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.m b/Sources/EeveeSpotifyC/LiveInstrumental.m
 new file mode 100644
 index 0000000..ed0044b
 --- /dev/null
-+++ b/Sources/EeveeSpotifyC/LiveInstrumental.c
++++ b/Sources/EeveeSpotifyC/LiveInstrumental.m
 @@ -0,0 +1,230 @@
 +#include "include/LiveInstrumental.h"
 +#include <AudioToolbox/AudioToolbox.h>
@@ -964,13 +964,13 @@ index 0000000..c4d058f
 +uint32_t EeveeInstrumentalStatus(void);
 diff --git a/Tests/LiveInstrumentalStream.c b/Tests/LiveInstrumentalStream.c
 new file mode 100644
-index 0000000..cc553f2
+index 0000000..22151c4
 --- /dev/null
 +++ b/Tests/LiveInstrumentalStream.c
 @@ -0,0 +1,72 @@
 +#include <assert.h>
 +#include <stdio.h>
-+#include "../Sources/EeveeSpotifyC/LiveInstrumental.c"
++#include "../Sources/EeveeSpotifyC/LiveInstrumental.m"
 +
 +enum { Frames = 256 };
 +static float samples[Frames * 2];
