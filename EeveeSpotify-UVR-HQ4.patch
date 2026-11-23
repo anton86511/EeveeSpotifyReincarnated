@@ -277,6 +277,175 @@ index 0000000..82a376f
 +    }
 +
 +}
+diff --git a/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift b/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
+index e00c3b6..1b1f6d2 100644
+--- a/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
++++ b/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
+@@ -1,3 +1,5 @@
++import Combine
++import EeveeSpotifyC
+ import Orion
+ import UIKit
+ 
+@@ -22,7 +24,7 @@ class KaraokeFooterUnitHook: ClassHook<UIViewController> {
+ enum KaraokeFooterButton {
+     static let meter = PerfMeter("Karaoke][FooterButton")
+ 
+-    private static let button: UIButton = {
++    fileprivate static func capsuleConfiguration() -> UIButton.Configuration {
+         var config: UIButton.Configuration
+         if #available(iOS 26.0, *), KaraokeGlass.isEnabled {
+             config = .glass()
+@@ -30,7 +32,6 @@ enum KaraokeFooterButton {
+             config = .plain()
+             config.background.backgroundColor = UIColor(white: 1, alpha: 0.15)
+         }
+-        config.title = "karaoke_word_synced_button".localized
+         config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
+             var attributes = $0
+             attributes.font = .systemFont(ofSize: 13, weight: .semibold)
+@@ -39,6 +40,12 @@ enum KaraokeFooterButton {
+         config.baseForegroundColor = .white
+         config.cornerStyle = .capsule
+         config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14)
++        return config
++    }
++
++    private static let button: UIButton = {
++        var config = capsuleConfiguration()
++        config.title = "karaoke_word_synced_button".localized
+         let button = UIButton(configuration: config)
+         button.overrideUserInterfaceStyle = .dark
+         button.addAction(UIAction { _ in KaraokeOverlayPresenter.present() }, for: .primaryActionTriggered)
+@@ -47,7 +54,9 @@ enum KaraokeFooterButton {
+ 
+     private static let observer = NotificationCenter.default.addObserver(
+         forName: .eeveeKaraokeLyricsChanged, object: nil, queue: .main
+-    ) { _ in update() }
++    ) { _ in
++        if let root = button.superview { attach(to: root) }
++    }
+ 
+     private static weak var row: UIStackView?
+ 
+@@ -58,21 +67,110 @@ enum KaraokeFooterButton {
+         }
+         guard let row else { return }
+         let rowFrame = row.convert(row.bounds, to: root)
++        let showLyrics = UserDefaults.lyricsSource.supportsCustomLyricsView &&
++            KaraokeOverlayPresenter.isAvailableForCurrentTrack()
++        button.isHidden = !showLyrics
+         if button.superview !== root { root.addSubview(button) }
+-        else if root.subviews.last !== button { root.bringSubviewToFront(button) }
+-        let size = button.intrinsicContentSize
+-        let frame = CGRect(x: root.bounds.midX - size.width / 2, y: rowFrame.midY - size.height / 2, width: size.width, height: size.height)
+-        if button.frame != frame { button.frame = frame }
++
++        let effect: UIButton?
++        if #available(iOS 16.0, *), EeveeInstrumentalAvailable() {
++            effect = InstrumentalFooterButton.shared.button
++        } else {
++            effect = nil
++        }
++
++        let midX = root.bounds.midX
++        let nativeFrames = row.arrangedSubviews.filter {
++            !$0.isHidden && !$0.bounds.isEmpty &&
++                (type(of: $0) != UIView.self || !$0.subviews.isEmpty || $0.isAccessibilityElement)
++        }
++            .map { $0.convert($0.bounds, to: root) }
++        let left = nativeFrames.filter { $0.midX < midX }.map(\.maxX).max() ?? rowFrame.minX
++        let right = nativeFrames.filter { $0.midX >= midX }.map(\.minX).min() ?? rowFrame.maxX
++        let available = max(0, right - left - 8)
++        let effectWidth: CGFloat = 44
++        let spacing: CGFloat = 6
++        let hasRoom = available >= (showLyrics ? 2 * effectWidth + spacing : effectWidth)
++        let showEffect = effect != nil && hasRoom
++        var lyricsConfig = capsuleConfiguration()
++        lyricsConfig.title = "karaoke_word_synced_button".localized
++        let lyricsTitle = lyricsConfig.title ?? ""
++        let titleWidth = (lyricsTitle as NSString).size(withAttributes: [
++            .font: UIFont.systemFont(ofSize: 13, weight: .semibold)
++        ]).width
++        let lyricsWidth = ceil(titleWidth) + lyricsConfig.contentInsets.leading + lyricsConfig.contentInsets.trailing
++        let compactLyrics = showEffect && lyricsWidth + effectWidth + spacing > available
++        if compactLyrics {
++            lyricsConfig.title = nil
++            lyricsConfig.image = UIImage(systemName: "quote.bubble")
++        }
++        if (button.configuration?.image != nil) != compactLyrics { button.configuration = lyricsConfig }
++        button.accessibilityLabel = "karaoke_word_synced_button".localized
++
++        let lyricSize = compactLyrics ? CGSize(width: effectWidth, height: 32) : button.intrinsicContentSize
++        let totalWidth = (showLyrics ? lyricSize.width : 0) +
++            (showEffect ? effectWidth : 0) + (showLyrics && showEffect ? spacing : 0)
++        let startX = showEffect ? (left + right - totalWidth) / 2 : midX - totalWidth / 2
++        if showLyrics {
++            let frame = CGRect(x: startX, y: rowFrame.midY - lyricSize.height / 2,
++                               width: lyricSize.width, height: lyricSize.height)
++            if button.frame != frame { button.frame = frame }
++            if !showEffect && root.subviews.last !== button { root.bringSubviewToFront(button) }
++        }
++        if let effect {
++            if effect.superview !== root { root.addSubview(effect) }
++            effect.isHidden = !showEffect
++            if showEffect {
++                let x = startX + (showLyrics ? lyricSize.width + spacing : 0)
++                let frame = CGRect(x: x, y: rowFrame.midY - 22, width: effectWidth, height: 44)
++                if effect.frame != frame { effect.frame = frame }
++                if root.subviews.last !== effect {
++                    if showLyrics { root.bringSubviewToFront(button) }
++                    root.bringSubviewToFront(effect)
++                }
++            }
++        }
++    }
++}
++
++@available(iOS 16.0, *)
++private final class InstrumentalFooterButton {
++    static let shared = InstrumentalFooterButton()
++    let button = UIButton()
++    private let player = LiveInstrumentalSettings.shared
++    private var changes: AnyCancellable?
++
++    private init() {
++        button.overrideUserInterfaceStyle = .dark
++        button.addAction(UIAction { [weak self] _ in
++            guard let self else { return }
++            self.player.setEnabled(!self.player.enabled)
++        }, for: .primaryActionTriggered)
++        changes = player.objectWillChange
++            .receive(on: DispatchQueue.main)
++            .sink { [weak self] _ in self?.update() }
+         update()
+     }
+ 
+-    private static func update() {
+-        button.isHidden = !KaraokeOverlayPresenter.isAvailableForCurrentTrack()
++    private func update() {
++        let enabled = player.enabled
++        var config = KaraokeFooterButton.capsuleConfiguration()
++        config.image = UIImage(systemName: enabled ? "mic.slash.fill" : "mic.slash")
++        config.baseForegroundColor = enabled ? UIColor(red: 0.42, green: 0.93, blue: 0.58, alpha: 1) : .white
++        config.contentInsets = .init(top: 0, leading: 0, bottom: 0, trailing: 0)
++        button.configuration = config
++        button.isSelected = enabled
++        button.isEnabled = player.canToggle
++        button.accessibilityLabel = "instrumental_title".localized
++        button.accessibilityValue = (enabled ? "instrumental_switch_on" : "instrumental_switch_off").localized
+     }
+ }
+ 
+ func activateKaraokeFooterButton() {
+-    guard #available(iOS 15.0, *), UserDefaults.lyricsSource.supportsCustomLyricsView else { return }
++    guard #available(iOS 15.0, *) else { return }
++    if !UserDefaults.lyricsSource.supportsCustomLyricsView {
++        guard #available(iOS 16.0, *), EeveeInstrumentalAvailable() else { return }
++    }
+     let start = CFAbsoluteTimeGetCurrent()
+     guard NSClassFromString(KaraokeFooterUnitHook.targetName) != nil else {
+         eeveeLog("[EeveeSpotify][Karaoke] Footer button skipped: footer unit missing")
 diff --git a/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift b/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift
 index 0ac57b2..5584fba 100644
 --- a/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift
@@ -341,10 +510,10 @@ index 0ac57b2..5584fba 100644
  
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
 new file mode 100644
-index 0000000..d41680b
+index 0000000..865e163
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,180 @@
 +import Combine
 +import CoreML
 +import EeveeSpotifyC
@@ -369,7 +538,7 @@ index 0000000..d41680b
 +                    get: { player.enabled },
 +                    set: player.setEnabled
 +                ))
-+                .disabled(player.busy || (!player.enabled && player.mode == .hq4 && player.modelURL == nil))
++                .disabled(!player.canToggle)
 +                TimelineView(.periodic(from: .now, by: 0.5)) { _ in
 +                    Text(player.status.localized)
 +                        .foregroundColor(.secondary)
@@ -389,7 +558,7 @@ index 0000000..d41680b
 +    }
 +}
 +
-+private enum InstrumentalMode: String, CaseIterable {
++enum InstrumentalMode: String, CaseIterable {
 +    case immediate, hq4
 +
 +    var title: String { self == .immediate ? "instrumental_mode_immediate" : "instrumental_mode_hq4" }
@@ -402,7 +571,7 @@ index 0000000..d41680b
 +}
 +
 +@available(iOS 16.0, *)
-+private final class LiveInstrumentalSettings: ObservableObject {
++final class LiveInstrumentalSettings: ObservableObject {
 +    // Keep the playback effect active when the user closes settings.
 +    static let shared = LiveInstrumentalSettings()
 +    private let worker = LiveInstrumentalWorker()
@@ -443,6 +612,10 @@ index 0000000..d41680b
 +        bundledModel ?? (FileManager.default.fileExists(atPath: storedModel.path) ? storedModel : nil)
 +    }
 +
++    var canToggle: Bool {
++        !busy && (enabled || mode == .immediate || modelURL != nil)
++    }
++
 +    var status: String {
 +        if let message = message { return message }
 +        if busy { return "instrumental_loading" }
@@ -458,6 +631,7 @@ index 0000000..d41680b
 +    }
 +
 +    func setEnabled(_ enable: Bool) {
++        guard canToggle, enable != enabled else { return }
 +        message = nil
 +        if !enable {
 +            worker.stop()
@@ -1161,11 +1335,13 @@ index 0000000..73f2fbc
 +}
 diff --git a/Tools/LiveInstrumental.md b/Tools/LiveInstrumental.md
 new file mode 100644
-index 0000000..2b6bb33
+index 0000000..0844d5c
 --- /dev/null
 +++ b/Tools/LiveInstrumental.md
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +# 播放去人聲
++
++在「正在播放」畫面中，播放控制下方的麥克風圖示也能切換去人聲。這個按鈕與設定頁共用目前的模式和開關狀態。
 +
 +此功能需要 iOS 16 以上，以及包含新版 Pixie 音訊模組的 EeveeSpotify IPA。相容的 Spotify 建置版本由 Pixie 封裝流程決定，目前為 9.2.0 與 9.2.2。開啟 **EeveeSpotify 設定 → 播放去人聲**，選擇處理模式再打開開關。即時模式無額外緩衝，會抑制置於立體聲中央的人聲與樂器，部分人聲可能保留。AI 模式需要 HQ 4 模型。離開設定頁後，效果持續作用於這支 iPhone 上的播放。App 會記住模式與開關。使用 GitHub Actions 的 **Build IPA (PATCHED)** 時，可勾選 **uvr_hq4** 隨 IPA 內建模型，安裝後可直接開啟。
 +
@@ -1288,10 +1464,10 @@ index 0000000..4ad01e9
 +test -d "$work/InstHQ4.mlmodelc"
 +mv "$work/InstHQ4.mlpackage" "$work/InstHQ4.mlmodelc" "$output/"
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings
-index 7bfc293..5211d76 100644
+index 7bfc293..02424e3 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
-@@ -518,3 +518,22 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
+@@ -518,3 +518,24 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
  restart_later = "Later";
  manage_downloads = "Manage downloads";
  manage_downloads_subtitle = "Pixie offline downloads";
@@ -1314,11 +1490,13 @@ index 7bfc293..5211d76 100644
 +"instrumental_unsupported_audio" = "This audio format cannot be processed. Playing original audio.";
 +"instrumental_model_error" = "Could not load the HQ 4 Core ML model.";
 +"instrumental_processing_error" = "Vocal removal stopped after a model error. Original audio has resumed.";
++"instrumental_switch_on" = "On";
++"instrumental_switch_off" = "Off";
 diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings
-index 6309ef0..ba735ef 100644
+index 6309ef0..2ce2e36 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
-@@ -516,3 +516,22 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
+@@ -516,3 +516,24 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
  glass_lyrics_view = "自定義歌詞檢視";
  lyrics_source_restart_popup = "請重新啟動 Spotify，讓新的歌詞來源在所有位置生效。在此之前，已播放過的歌曲會保留舊歌詞。";
  restart_later = "稍後";
@@ -1341,3 +1519,5 @@ index 6309ef0..ba735ef 100644
 +"instrumental_unsupported_audio" = "目前的音訊格式無法處理，正在播放原聲。";
 +"instrumental_model_error" = "無法載入 HQ 4 Core ML 模型。";
 +"instrumental_processing_error" = "模型處理失敗，已恢復播放原聲。";
++"instrumental_switch_on" = "開啟";
++"instrumental_switch_off" = "關閉";
