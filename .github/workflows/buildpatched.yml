@@ -33,7 +33,7 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -192,11 +192,6 @@ jobs:
               || { echo "::error::SpotifyAudioProbe.dylib missing from IPA"; exit 1; }
           echo "Pixie companion bundled: Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib"
 
-      - uses: actions/setup-python@v5
-        if: ${{ inputs.ipa_url != '' && inputs.uvr_hq4 }}
-        with:
-          python-version: '3.12'
-
       - name: Bundle UVR Inst HQ 4
         if: ${{ inputs.ipa_url != '' && inputs.uvr_hq4 }}
         run: |
@@ -207,9 +202,12 @@ jobs:
           fi
           model_dir="$(mktemp -d)"
           trap 'rm -rf "$model_dir"' EXIT
-          bash Tools/prepare-hq4-model.sh "$model_dir"
-          mkdir -p "$model_dir/Payload/Spotify.app"
-          mv "$model_dir/InstHQ4.mlmodelc" "$model_dir/Payload/Spotify.app/"
+          model_source="$model_dir/model-source.ipa"
+          model_url='https://github.com/anton86511/EeveeSpotifyReincarnated/releases/download/v7.5.0-spotify-9.2.2-hq4-nowplaying/EeveeSpotify-9.2.2-UVR-HQ4-NowPlaying.ipa'
+          curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location --retry 3             --output "$model_source" -- "$model_url"
+          printf '%s  %s\n' 3316a28d783f5f667c307cabc14c9336d3b82e4205ce89d861e0372a0fe62359 "$model_source" | shasum -a 256 -c
+          unzip -q "$model_source" 'Payload/Spotify.app/InstHQ4.mlmodelc/*' -d "$model_dir"
+          test -s "$model_dir/Payload/Spotify.app/InstHQ4.mlmodelc/weights/weight.bin"
           ipa_path="$(pwd)/$OUT_IPA"
           (cd "$model_dir" && zip -qry "$ipa_path" Payload/Spotify.app/InstHQ4.mlmodelc)
           unzip -tq "$OUT_IPA"
