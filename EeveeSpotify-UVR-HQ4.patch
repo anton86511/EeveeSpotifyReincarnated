@@ -307,16 +307,21 @@ index 0000000..c97361b
 +
 +}
 diff --git a/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift b/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
-index e00c3b6..1b1f6d2 100644
+index e00c3b6..6f5c0db 100644
 --- a/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
 +++ b/Sources/EeveeSpotify/Karaoke/KaraokeFooterButton.x.swift
-@@ -1,3 +1,5 @@
+@@ -1,7 +1,10 @@
 +import Combine
 +import EeveeSpotifyC
  import Orion
  import UIKit
  
-@@ -22,7 +24,7 @@ class KaraokeFooterUnitHook: ClassHook<UIViewController> {
+ struct KaraokeFooterGroup: HookGroup {}
++struct InstrumentalNowPlayingGroup: HookGroup {}
+ 
+ extension Notification.Name {
+     static let eeveeKaraokeLyricsChanged = Notification.Name("EeveeKaraokeLyricsChanged")
+@@ -22,7 +25,7 @@ class KaraokeFooterUnitHook: ClassHook<UIViewController> {
  enum KaraokeFooterButton {
      static let meter = PerfMeter("Karaoke][FooterButton")
  
@@ -325,7 +330,7 @@ index e00c3b6..1b1f6d2 100644
          var config: UIButton.Configuration
          if #available(iOS 26.0, *), KaraokeGlass.isEnabled {
              config = .glass()
-@@ -30,7 +32,6 @@ enum KaraokeFooterButton {
+@@ -30,7 +33,6 @@ enum KaraokeFooterButton {
              config = .plain()
              config.background.backgroundColor = UIColor(white: 1, alpha: 0.15)
          }
@@ -333,7 +338,7 @@ index e00c3b6..1b1f6d2 100644
          config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer {
              var attributes = $0
              attributes.font = .systemFont(ofSize: 13, weight: .semibold)
-@@ -39,6 +40,12 @@ enum KaraokeFooterButton {
+@@ -39,15 +41,24 @@ enum KaraokeFooterButton {
          config.baseForegroundColor = .white
          config.cornerStyle = .capsule
          config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14)
@@ -345,8 +350,10 @@ index e00c3b6..1b1f6d2 100644
 +        config.title = "karaoke_word_synced_button".localized
          let button = UIButton(configuration: config)
          button.overrideUserInterfaceStyle = .dark
++        button.accessibilityLabel = "karaoke_word_synced_button".localized
          button.addAction(UIAction { _ in KaraokeOverlayPresenter.present() }, for: .primaryActionTriggered)
-@@ -47,7 +54,9 @@ enum KaraokeFooterButton {
+         return button
+     }()
  
      private static let observer = NotificationCenter.default.addObserver(
          forName: .eeveeKaraokeLyricsChanged, object: nil, queue: .main
@@ -357,7 +364,7 @@ index e00c3b6..1b1f6d2 100644
  
      private static weak var row: UIStackView?
  
-@@ -58,21 +67,110 @@ enum KaraokeFooterButton {
+@@ -58,20 +69,111 @@ enum KaraokeFooterButton {
          }
          guard let row else { return }
          let rowFrame = row.convert(row.bounds, to: root)
@@ -366,79 +373,74 @@ index e00c3b6..1b1f6d2 100644
 +        button.isHidden = !showLyrics
          if button.superview !== root { root.addSubview(button) }
 -        else if root.subviews.last !== button { root.bringSubviewToFront(button) }
--        let size = button.intrinsicContentSize
++
+         let size = button.intrinsicContentSize
 -        let frame = CGRect(x: root.bounds.midX - size.width / 2, y: rowFrame.midY - size.height / 2, width: size.width, height: size.height)
--        if button.frame != frame { button.frame = frame }
++        let frame = CGRect(x: root.bounds.midX - size.width / 2,
++                           y: rowFrame.midY - size.height / 2,
++                           width: size.width, height: size.height)
+         if button.frame != frame { button.frame = frame }
++        if showLyrics && root.subviews.last !== button { root.bringSubviewToFront(button) }
++    }
++}
 +
-+        let effect: UIButton?
-+        if #available(iOS 16.0, *), EeveeInstrumentalAvailable() {
-+            effect = InstrumentalFooterButton.shared.button
-+        } else {
-+            effect = nil
-+        }
++class InstrumentalInformationUnitHook: ClassHook<UIViewController> {
++    typealias Group = InstrumentalNowPlayingGroup
++    static let targetName = PlayerInfoDeclutterHook.targetName
 +
-+        let midX = root.bounds.midX
-+        let nativeFrames = row.arrangedSubviews.filter {
-+            !$0.isHidden && !$0.bounds.isEmpty &&
-+                (type(of: $0) != UIView.self || !$0.subviews.isEmpty || $0.isAccessibilityElement)
-+        }
-+            .map { $0.convert($0.bounds, to: root) }
-+        let left = nativeFrames.filter { $0.midX < midX }.map(\.maxX).max() ?? rowFrame.minX
-+        let right = nativeFrames.filter { $0.midX >= midX }.map(\.minX).min() ?? rowFrame.maxX
-+        let available = max(0, right - left - 8)
-+        let effectWidth: CGFloat = 44
-+        let spacing: CGFloat = 6
-+        let hasRoom = available >= (showLyrics ? 2 * effectWidth + spacing : effectWidth)
-+        let showEffect = effect != nil && hasRoom
-+        var lyricsConfig = capsuleConfiguration()
-+        lyricsConfig.title = "karaoke_word_synced_button".localized
-+        let lyricsTitle = lyricsConfig.title ?? ""
-+        let titleWidth = (lyricsTitle as NSString).size(withAttributes: [
-+            .font: UIFont.systemFont(ofSize: 13, weight: .semibold)
-+        ]).width
-+        let lyricsWidth = ceil(titleWidth) + lyricsConfig.contentInsets.leading + lyricsConfig.contentInsets.trailing
-+        let compactLyrics = showEffect && lyricsWidth + effectWidth + spacing > available
-+        if compactLyrics {
-+            lyricsConfig.title = nil
-+            lyricsConfig.image = UIImage(systemName: "quote.bubble")
-+        }
-+        if (button.configuration?.image != nil) != compactLyrics { button.configuration = lyricsConfig }
-+        button.accessibilityLabel = "karaoke_word_synced_button".localized
-+
-+        let lyricSize = compactLyrics ? CGSize(width: effectWidth, height: 32) : button.intrinsicContentSize
-+        let totalWidth = (showLyrics ? lyricSize.width : 0) +
-+            (showEffect ? effectWidth : 0) + (showLyrics && showEffect ? spacing : 0)
-+        let startX = showEffect ? (left + right - totalWidth) / 2 : midX - totalWidth / 2
-+        if showLyrics {
-+            let frame = CGRect(x: startX, y: rowFrame.midY - lyricSize.height / 2,
-+                               width: lyricSize.width, height: lyricSize.height)
-+            if button.frame != frame { button.frame = frame }
-+            if !showEffect && root.subviews.last !== button { root.bringSubviewToFront(button) }
-+        }
-+        if let effect {
-+            if effect.superview !== root { root.addSubview(effect) }
-+            effect.isHidden = !showEffect
-+            if showEffect {
-+                let x = startX + (showLyrics ? lyricSize.width + spacing : 0)
-+                let frame = CGRect(x: x, y: rowFrame.midY - 22, width: effectWidth, height: 44)
-+                if effect.frame != frame { effect.frame = frame }
-+                if root.subviews.last !== effect {
-+                    if showLyrics { root.bringSubviewToFront(button) }
-+                    root.bringSubviewToFront(effect)
-+                }
-+            }
-+        }
++    func viewDidLayoutSubviews() {
++        orig.viewDidLayoutSubviews()
++        guard #available(iOS 16.0, *), let root = target.viewIfLoaded else { return }
++        InstrumentalNowPlayingButton.attach(to: root)
 +    }
 +}
 +
 +@available(iOS 16.0, *)
-+private final class InstrumentalFooterButton {
-+    static let shared = InstrumentalFooterButton()
-+    let button = UIButton()
++private final class InstrumentalNowPlayingButton {
++    private static var rowKey: UInt8 = 0
++    private let button = UIButton()
++    private let container = UIView()
++
++    static func attach(to root: UIView) {
++        guard let row = root.eeveeFirst(UIStackView.self, where: {
++            $0.axis == .horizontal && addToIndex(in: $0).map { $0 > 0 } == true
++        }), let addToIndex = addToIndex(in: row) else { return }
++        let control: InstrumentalNowPlayingButton
++        if let existing = objc_getAssociatedObject(row, &rowKey) as? InstrumentalNowPlayingButton {
++            control = existing
++        } else {
++            control = InstrumentalNowPlayingButton()
++            objc_setAssociatedObject(row, &rowKey, control, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
++        }
++
++        if !row.arrangedSubviews.contains(where: { $0 === control.container }) {
++            row.insertArrangedSubview(control.container, at: addToIndex)
++        }
++    }
++
++    private static func addToIndex(in row: UIStackView) -> Int? {
++        row.arrangedSubviews.firstIndex { $0.eeveeContainsClass("AddToButton") }
++    }
++
 +    private let player = LiveInstrumentalSettings.shared
 +    private var changes: AnyCancellable?
 +
 +    private init() {
++        let side: CGFloat = 44
++        container.translatesAutoresizingMaskIntoConstraints = false
++        button.translatesAutoresizingMaskIntoConstraints = false
++        container.addSubview(button)
++        let minimumHeight = container.heightAnchor.constraint(greaterThanOrEqualToConstant: side)
++        minimumHeight.priority = .defaultHigh
++        NSLayoutConstraint.activate([
++            container.widthAnchor.constraint(equalToConstant: side),
++            minimumHeight,
++            button.heightAnchor.constraint(equalToConstant: side),
++            button.widthAnchor.constraint(equalTo: container.widthAnchor),
++            button.centerXAnchor.constraint(equalTo: container.centerXAnchor),
++            button.centerYAnchor.constraint(equalTo: container.centerYAnchor)
++        ])
++
 +        button.overrideUserInterfaceStyle = .dark
 +        button.addAction(UIAction { [weak self] _ in
 +            guard let self else { return }
@@ -467,14 +469,17 @@ index e00c3b6..1b1f6d2 100644
  }
  
  func activateKaraokeFooterButton() {
--    guard #available(iOS 15.0, *), UserDefaults.lyricsSource.supportsCustomLyricsView else { return }
-+    guard #available(iOS 15.0, *) else { return }
-+    if !UserDefaults.lyricsSource.supportsCustomLyricsView {
-+        guard #available(iOS 16.0, *), EeveeInstrumentalAvailable() else { return }
++    if #available(iOS 16.0, *), EeveeInstrumentalAvailable() {
++        if NSClassFromString(InstrumentalInformationUnitHook.targetName) != nil {
++            InstrumentalNowPlayingGroup().activate()
++        } else {
++            eeveeLog("[EeveeSpotify][Instrumental] Information unit missing")
++        }
 +    }
++
+     guard #available(iOS 15.0, *), UserDefaults.lyricsSource.supportsCustomLyricsView else { return }
      let start = CFAbsoluteTimeGetCurrent()
      guard NSClassFromString(KaraokeFooterUnitHook.targetName) != nil else {
-         eeveeLog("[EeveeSpotify][Karaoke] Footer button skipped: footer unit missing")
 diff --git a/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift b/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift
 index 0ac57b2..5584fba 100644
 --- a/Sources/EeveeSpotify/Karaoke/KaraokePlaybackTracker.swift
