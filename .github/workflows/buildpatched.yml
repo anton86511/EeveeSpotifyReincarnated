@@ -17,6 +17,10 @@ on:
         default: false
         required: false
         type: boolean
+      mel_band_roformer:
+        description: "Include 2-second Mel-Band RoFormer and UVR Inst HQ 4"
+        default: false
+        type: boolean
       upload_method:
         description: "Where to upload the built IPA"
         default: "artifacts"
@@ -24,6 +28,7 @@ on:
         type: choice
         options:
           - artifacts
+          - github_release
           - filebin
           - both
 
@@ -32,7 +37,34 @@ env:
   SWIFTPROTOBUF_VERSION: "1.29.0"
 
 jobs:
+  mel-band-model:
+    if: ${{ inputs.ipa_url != '' && inputs.mel_band_roformer }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Export and validate Mel-Band RoFormer
+        run: |
+          git apply EeveeSpotify-UVR-HQ4.patch
+          python -m pip install 'torch==2.7.0' 'coremltools==9.0' 'numpy<2' 'einops==0.8.1' 'beartype' 'librosa' 'rotary-embedding-torch==0.3.5' 'huggingface-hub'
+          python Tools/prepare-mel-band-roformer.py "$RUNNER_TEMP/MelBandRoFormer2s.mlpackage"
+          xcrun --sdk iphoneos coremlcompiler compile "$RUNNER_TEMP/MelBandRoFormer2s.mlpackage" "$RUNNER_TEMP"
+          test -s "$RUNNER_TEMP/MelBandRoFormer2s.mlmodelc/weights/weight.bin"
+          tar -cf "$RUNNER_TEMP/MelBandRoFormer2s.tar" -C "$RUNNER_TEMP" MelBandRoFormer2s.mlmodelc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoFormer-model
+          path: ${{ runner.temp }}/MelBandRoFormer2s.tar
+          if-no-files-found: error
+
   build:
+    needs: mel-band-model
+    if: ${{ !cancelled() && (needs.mel-band-model.result == 'success' || needs.mel-band-model.result == 'skipped') }}
     runs-on: macos-26-intel
     steps:
       - name: Checkout
@@ -43,7 +75,7 @@ jobs:
           submodules: recursive
 
       - name: Apply the HQ 4 source patch
-        if: ${{ inputs.uvr_hq4 }}
+        if: ${{ inputs.uvr_hq4 || inputs.mel_band_roformer }}
         run: |
           git apply --check EeveeSpotify-UVR-HQ4.patch
           git apply EeveeSpotify-UVR-HQ4.patch
@@ -193,7 +225,7 @@ jobs:
           echo "Pixie companion bundled: Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib"
 
       - name: Bundle UVR Inst HQ 4
-        if: ${{ inputs.ipa_url != '' && inputs.uvr_hq4 }}
+        if: ${{ inputs.ipa_url != '' && (inputs.uvr_hq4 || inputs.mel_band_roformer) }}
         run: |
           set -euo pipefail
           if ! unzip -Z1 "$OUT_IPA" | grep -Fx 'Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib' >/dev/null; then
@@ -210,6 +242,26 @@ jobs:
           test -s "$model_dir/Payload/Spotify.app/InstHQ4.mlmodelc/weights/weight.bin"
           ipa_path="$(pwd)/$OUT_IPA"
           (cd "$model_dir" && zip -qry "$ipa_path" Payload/Spotify.app/InstHQ4.mlmodelc)
+          unzip -tq "$OUT_IPA"
+
+      - name: Fetch compiled Mel-Band RoFormer
+        if: ${{ inputs.ipa_url != '' && inputs.mel_band_roformer }}
+        uses: actions/download-artifact@v4
+        with:
+          name: RoFormer-model
+          path: ${{ runner.temp }}/roformer
+
+      - name: Bundle Mel-Band RoFormer
+        if: ${{ inputs.ipa_url != '' && inputs.mel_band_roformer }}
+        run: |
+          set -euo pipefail
+          model_dir="$RUNNER_TEMP/roformer"
+          app="Payload/Spotify.app"
+          mkdir -p "$model_dir/$app"
+          tar -xf "$model_dir/MelBandRoFormer2s.tar" -C "$model_dir/$app"
+          test -s "$model_dir/$app/MelBandRoFormer2s.mlmodelc/weights/weight.bin"
+          ipa_path="$PWD/$OUT_IPA"
+          (cd "$model_dir" && zip -qry "$ipa_path" "$app/MelBandRoFormer2s.mlmodelc")
           unzip -tq "$OUT_IPA"
 
       - name: Inject OpeninSafariSpotify extension into IPA PlugIns
@@ -250,7 +302,7 @@ jobs:
           Tools/alt-icons.sh "$OUT_IPA"
 
       - name: Upload IPA artifact
-        if: ${{ inputs.ipa_url != '' && (inputs.upload_method == 'artifacts' || inputs.upload_method == 'both') }}
+        if: ${{ inputs.ipa_url != '' && (inputs.upload_method == 'artifacts' || inputs.upload_method == 'github_release' || inputs.upload_method == 'both') }}
         uses: actions/upload-artifact@v4
         with:
           name: EeveeSpotify-IPA
@@ -275,3 +327,34 @@ jobs:
             echo "- **URL:** ${DOWNLOAD_URL}"
             echo "- _Filebin auto-deletes bins after a period of inactivity — download promptly._"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release-roformer:
+    needs: build
+    if: ${{ github.ref == 'refs/heads/codex/mel-band-roformer-2s' && inputs.branch == github.ref_name && inputs.mel_band_roformer && inputs.upload_method == 'github_release' && inputs.ipa_url != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: EeveeSpotify-IPA
+      - name: Verify and publish the IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(EeveeSpotify-*-9.2.2.ipa)
+          [[ ${#files[@]} -eq 1 ]]
+          asset=EeveeSpotify-9.2.2-MelBandRoFormer-2s.ipa
+          mv "${files[0]}" "$asset"
+          unzip -tq "$asset"
+          unzip -Z1 "$asset" > ipa-entries.txt
+          for component in MelBandRoFormer2s InstHQ4; do
+            grep -Fx "Payload/Spotify.app/$component.mlmodelc/weights/weight.bin" ipa-entries.txt
+          done
+          grep -Fx 'Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib' ipa-entries.txt
+          tag="spotify-9.2.2-melband-roformer-2s-$GITHUB_RUN_ID"
+          gh release create "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title 'Spotify 9.2.2 · Mel-Band RoFormer Core ML 2 秒' --prerelease --latest=false \
+            --notes '加入 Mel-Band RoFormer 2 秒視窗，播放緩衝為 2.75 秒。可選僅 CPU、GPU 優先或 CPU＋GPU。附帶 HQ 4 與原有即時模式。iPhone 實機效能尚待驗證。'
