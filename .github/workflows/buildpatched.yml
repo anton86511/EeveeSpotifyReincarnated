@@ -41,17 +41,17 @@ jobs:
     if: ${{ inputs.mel_band_roformer }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      actions: read
     steps:
       - name: Retrieve previously validated 2-second model
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          url='https://github.com/anton86511/EeveeSpotifyReincarnated/releases/download/spotify-9.2.2-melband-roformer-2s-45917687477/EeveeSpotify-9.2.2-MelBandRoFormer-2s.ipa'
-          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 -o "$RUNNER_TEMP/model-source.ipa" "$url"
-          printf '%s  %s\n' 92dd5d54baa37f03c679ed61dc67e0c3d5c490a8577174548ee99d8a7b4a813e "$RUNNER_TEMP/model-source.ipa" | sha256sum -c
-          unzip -q "$RUNNER_TEMP/model-source.ipa" 'Payload/Spotify.app/MelBandRoFormer2s.mlmodelc/*' 'Payload/Spotify.app/MelBandRoFormer-LICENSE.txt' -d "$RUNNER_TEMP"
-          test -s "$RUNNER_TEMP/Payload/Spotify.app/MelBandRoFormer2s.mlmodelc/weights/weight.bin"
-          tar -cf "$RUNNER_TEMP/MelBandRoFormer2s.tar" -C "$RUNNER_TEMP/Payload/Spotify.app" \
-            MelBandRoFormer2s.mlmodelc MelBandRoFormer-LICENSE.txt
+          gh run download 45917687477 --repo "$GITHUB_REPOSITORY" \
+            --name RoFormer-model --dir "$RUNNER_TEMP"
+          test -s "$RUNNER_TEMP/MelBandRoFormer2s.tar"
       - uses: actions/upload-artifact@v4
         with:
           name: RoFormer-model
