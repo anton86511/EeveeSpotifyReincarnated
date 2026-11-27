@@ -52,10 +52,10 @@ index b8971ae..9fa8acc 100644
      bool backendReady;
 diff --git a/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
 new file mode 100644
-index 0000000..4b88459
+index 0000000..72a74c4
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,312 @@
 +import Accelerate
 +import CoreML
 +
@@ -64,11 +64,15 @@ index 0000000..4b88459
 +}
 +
 +@available(iOS 16.0, *)
-+final class HQ4InstrumentalModel {
++final class InstrumentalModel {
 +    static let sampleRate = 44_100
-+    static let window = 255 * 1_024
++    var window: Int { spectrum.sampleCount }
 +    // This hop maps to an exact whole number of frames at 48 kHz as well.
-+    static let hop = 235_200
++    let hop: Int
++
++    private let separatesVocals: Bool
++    private var roFormerModel: SpectrogramCoreML?
++    private var roFormerUsesGPU = false
 +
 +    private let spectrum: Spectrogram
 +    private let url: URL
@@ -77,10 +81,27 @@ index 0000000..4b88459
 +    private var gpuModel: SpectrogramCoreML?
 +    private var failedGPUEpoch: UInt?
 +
-+    init(url: URL, computeMode: InstrumentalComputeMode = .cpuAndGPU) throws {
++    init(url: URL, mode: InstrumentalMode, computeMode: InstrumentalComputeMode,
++         gpuEpoch: UInt? = nil) throws {
 +        self.url = url
 +        self.computeMode = computeMode
++        separatesVocals = mode == .melBand
++        if separatesVocals {
++            spectrum = try Spectrogram(size: 2_048, bins: 1_025, hop: 441, frames: 201, outputGain: 1)
++            hop = 66_150
++            cpuModel = nil
++            let useGPU = computeMode != .cpuOnly && gpuEpoch != nil
++            do {
++                try loadRoFormer(useGPU: useGPU)
++            } catch {
++                guard useGPU, computeMode == .cpuAndGPU else { throw error }
++                failedGPUEpoch = gpuEpoch
++                try loadRoFormer(useGPU: false)
++            }
++            return
++        }
 +        spectrum = try Spectrogram(size: 5_120, bins: 2_560, hop: 1_024, frames: 256, outputGain: 1)
++        hop = 235_200
 +        if computeMode == .gpuPreferred {
 +            cpuModel = nil
 +        } else {
@@ -91,6 +112,11 @@ index 0000000..4b88459
 +
 +    func separate(_ audio: [[Float]], gpuEpoch: () -> UInt?) throws -> [[Float]] {
 +        let epoch = computeMode == .cpuOnly ? nil : gpuEpoch()
++        if separatesVocals {
++            let mix = spectrum.analyze(audio)
++            let vocals = try predictRoFormer(mix, epoch: epoch, gpuEpoch: gpuEpoch)
++            return try spectrum.reconstruct(zip(mix, vocals).map { $0.0 - $0.1 })
++        }
 +        let canTryGPU = epoch != nil && epoch != failedGPUEpoch
 +        guard canTryGPU || cpuModel != nil else { throw InstrumentalError.gpuUnavailable }
 +
@@ -104,6 +130,30 @@ index 0000000..4b88459
 +            throw InstrumentalError.gpuUnavailable
 +        }
 +        return try spectrum.reconstruct(prediction)
++    }
++
++    private func loadRoFormer(useGPU: Bool) throws {
++        // Reload with one compute configuration at a time to limit model memory.
++        roFormerModel = nil
++        roFormerModel = try SpectrogramCoreML(url: url, bins: spectrum.bins, frames: spectrum.frames,
++                                             computeUnits: useGPU ? .cpuAndGPU : .cpuOnly)
++        roFormerUsesGPU = useGPU
++    }
++
++    private func predictRoFormer(_ mix: [Float], epoch: UInt?, gpuEpoch: () -> UInt?) throws -> [Float] {
++        if let epoch, epoch != failedGPUEpoch, gpuEpoch() == epoch {
++            do {
++                if !roFormerUsesGPU || roFormerModel == nil { try loadRoFormer(useGPU: true) }
++                if gpuEpoch() == epoch, let model = roFormerModel { return try model.predict(mix) }
++            } catch {
++                failedGPUEpoch = epoch
++                roFormerModel = nil
++            }
++        }
++        guard computeMode != .gpuPreferred else { throw InstrumentalError.gpuUnavailable }
++        if roFormerUsesGPU || roFormerModel == nil { try loadRoFormer(useGPU: false) }
++        guard let model = roFormerModel else { throw InstrumentalError.modelOutput }
++        return try model.predict(mix)
 +    }
 +
 +    private func predictWithGPU(_ mix: [Float], epoch: UInt, gpuEpoch: () -> UInt?) -> [Float]? {
@@ -208,7 +258,7 @@ index 0000000..4b88459
 +    private let synthesisScale: [Float]
 +
 +    init(size: Int, bins: Int, hop: Int, frames: Int, outputGain: Float) throws {
-+        guard bins > 0, bins <= size / 2 else { throw InstrumentalError.fft }
++        guard bins > 0, bins <= size / 2 + 1 else { throw InstrumentalError.fft }
 +        let length = vDSP_Length(size)
 +        guard let forward = vDSP_DFT_zop_CreateSetup(nil, length, .FORWARD) else { throw InstrumentalError.fft }
 +        guard let inverse = vDSP_DFT_zop_CreateSetup(nil, length, .INVERSE) else {
@@ -291,9 +341,9 @@ index 0000000..4b88459
 +            for frame in 0..<frames {
 +                re[0] = stem[realBase + frame]
 +                im[0] = 0
-+                re[half] = 0
++                re[half] = bins > half ? stem[realBase + half * frames + frame] : 0
 +                im[half] = 0
-+                for bin in 1..<bins {
++                for bin in 1..<min(bins, half) {
 +                    let index = bin * frames + frame
 +                    let real = stem[realBase + index]
 +                    let imag = stem[imagBase + index]
@@ -556,10 +606,10 @@ index 0ac57b2..5584fba 100644
  
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
 new file mode 100644
-index 0000000..e3a96e1
+index 0000000..8e339c2
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalSettingsView.swift
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,236 @@
 +import Combine
 +import CoreML
 +import EeveeSpotifyC
@@ -575,7 +625,7 @@ index 0000000..e3a96e1
 +        List {
 +            Section(footer: Text(player.mode.help.localized)) {
 +                Picker("instrumental_mode".localized, selection: $player.mode) {
-+                    ForEach(InstrumentalMode.allCases, id: \.self) { mode in
++                    ForEach(InstrumentalMode.supportedCases, id: \.self) { mode in
 +                        Text(mode.title.localized).tag(mode)
 +                    }
 +                }
@@ -590,7 +640,7 @@ index 0000000..e3a96e1
 +                        .foregroundColor(.secondary)
 +                }
 +            }
-+            if player.mode == .hq4 {
++            if player.mode != .immediate {
 +                Section(footer: Text(player.computeMode.help.localized)) {
 +                    Picker("instrumental_compute_mode".localized, selection: $player.computeMode) {
 +                        ForEach(InstrumentalComputeMode.allCases, id: \.self) { mode in
@@ -600,7 +650,7 @@ index 0000000..e3a96e1
 +                    .disabled(player.enabled || player.busy)
 +                }
 +            }
-+            if player.mode == .hq4 && !player.hasBundledModel {
++            if player.mode != .immediate && !player.hasBundledModel {
 +                Button("instrumental_import".localized) { choosingModel = true }
 +                    .disabled(player.enabled || player.busy)
 +            }
@@ -615,10 +665,37 @@ index 0000000..e3a96e1
 +}
 +
 +enum InstrumentalMode: String, CaseIterable {
-+    case immediate, hq4
++    case immediate, hq4, melBand
 +
-+    var title: String { self == .immediate ? "instrumental_mode_immediate" : "instrumental_mode_hq4" }
-+    var help: String { self == .immediate ? "instrumental_immediate_help" : "instrumental_buffer_help" }
++    static var supportedCases: [Self] {
++        if #available(iOS 18.0, *) { return allCases }
++        return [.immediate, .hq4]
++    }
++
++    var modelName: String? {
++        switch self {
++        case .immediate: return nil
++        case .hq4: return "InstHQ4"
++        case .melBand: return "MelBandRoFormer2s"
++        }
++    }
++
++    var missingModelMessage: String {
++        self == .melBand ? "instrumental_melBand_needs_model" : "instrumental_needs_model"
++    }
++
++    var modelErrorMessage: String {
++        self == .melBand ? "instrumental_melBand_model_error" : "instrumental_model_error"
++    }
++
++    var title: String { "instrumental_mode_\(rawValue)" }
++    var help: String {
++        switch self {
++        case .immediate: return "instrumental_immediate_help"
++        case .hq4: return "instrumental_buffer_help"
++        case .melBand: return "instrumental_melBand_help"
++        }
++    }
 +}
 +
 +enum InstrumentalComputeMode: String, CaseIterable {
@@ -660,7 +737,8 @@ index 0000000..e3a96e1
 +
 +    private init() {
 +        let defaults = UserDefaults.standard
-+        mode = InstrumentalMode(rawValue: defaults.string(forKey: Self.modeKey) ?? "") ?? .immediate
++        let savedMode = InstrumentalMode(rawValue: defaults.string(forKey: Self.modeKey) ?? "")
++        mode = InstrumentalMode.supportedCases.first { $0 == savedMode } ?? .immediate
 +        computeMode = defaults.string(forKey: Self.computeModeKey)
 +            .flatMap(InstrumentalComputeMode.init(rawValue:)) ?? .cpuAndGPU
 +    }
@@ -672,17 +750,21 @@ index 0000000..e3a96e1
 +    var hasBundledModel: Bool { bundledModel != nil }
 +
 +    private var bundledModel: URL? {
-+        Bundle.main.url(forResource: "InstHQ4", withExtension: "mlmodelc")
++        guard let name = mode.modelName else { return nil }
++        return Bundle.main.url(forResource: name, withExtension: "mlmodelc")
 +    }
 +
-+    private var storedModel: URL {
-+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++    private var storedModel: URL? {
++        guard let name = mode.modelName else { return nil }
++        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
 +            .appendingPathComponent("LiveInstrumental", isDirectory: true)
-+            .appendingPathComponent("InstHQ4.mlmodelc", isDirectory: true)
++            .appendingPathComponent("\(name).mlmodelc", isDirectory: true)
 +    }
 +
 +    var modelURL: URL? {
-+        bundledModel ?? (FileManager.default.fileExists(atPath: storedModel.path) ? storedModel : nil)
++        if let bundledModel = bundledModel { return bundledModel }
++        guard let storedModel = storedModel, FileManager.default.fileExists(atPath: storedModel.path) else { return nil }
++        return storedModel
 +    }
 +
 +    var canToggle: Bool {
@@ -692,7 +774,7 @@ index 0000000..e3a96e1
 +    var status: String {
 +        if let message = message { return message }
 +        if busy { return "instrumental_loading" }
-+        if mode == .hq4 && modelURL == nil { return "instrumental_needs_model" }
++        if mode != .immediate && modelURL == nil { return mode.missingModelMessage }
 +        if !enabled { return "instrumental_off" }
 +        switch EeveeInstrumentalStatus() {
 +        case 2: return "instrumental_playing"
@@ -721,24 +803,25 @@ index 0000000..e3a96e1
 +        }
 +        guard let modelURL = modelURL else { return }
 +        busy = true
-+        worker.start(url: modelURL, computeMode: computeMode) { started in
++        let selectedMode = mode
++        worker.start(url: modelURL, mode: selectedMode, computeMode: computeMode) { started in
 +            DispatchQueue.main.async {
 +                self.busy = false
 +                self.enabled = started
 +                self.defaults.set(started, forKey: self.enabledKey)
-+                if !started { self.message = "instrumental_model_error" }
++                if !started { self.message = selectedMode.modelErrorMessage }
 +            }
 +        }
 +    }
 +
 +    func importModel(_ url: URL) {
-+        guard url.pathExtension.lowercased() == "mlpackage" else {
-+            message = "instrumental_needs_model"
++        let selectedMode = mode
++        guard let destination = storedModel, url.pathExtension.lowercased() == "mlpackage" else {
++            message = selectedMode.missingModelMessage
 +            return
 +        }
 +        message = nil
 +        busy = true
-+        let destination = storedModel
 +        DispatchQueue.global(qos: .userInitiated).async {
 +            let access = url.startAccessingSecurityScopedResource()
 +            defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -746,7 +829,7 @@ index 0000000..e3a96e1
 +                let compiled = try MLModel.compileModel(at: url)
 +                let files = FileManager.default
 +                defer { try? files.removeItem(at: compiled) }
-+                _ = try HQ4InstrumentalModel(url: compiled)
++                _ = try InstrumentalModel(url: compiled, mode: selectedMode, computeMode: .cpuOnly)
 +                try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
 +                if files.fileExists(atPath: destination.path) {
 +                    _ = try files.replaceItemAt(destination, withItemAt: compiled)
@@ -757,7 +840,7 @@ index 0000000..e3a96e1
 +            } catch {
 +                DispatchQueue.main.async {
 +                    self.busy = false
-+                    self.message = "instrumental_model_error"
++                    self.message = selectedMode.modelErrorMessage
 +                }
 +            }
 +        }
@@ -765,10 +848,10 @@ index 0000000..e3a96e1
 +}
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
 new file mode 100644
-index 0000000..4223400
+index 0000000..c301004
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,235 @@
 +import EeveeSpotifyC
 +import Foundation
 +import UIKit
@@ -777,22 +860,24 @@ index 0000000..4223400
 +final class LiveInstrumentalWorker {
 +    private let queue = DispatchQueue(label: "com.eevee.instrumental", qos: .userInitiated)
 +    private var timer: DispatchSourceTimer?
-+    private var model: HQ4InstrumentalModel?
-+    private var stream: HQ4Stream?
++    private var model: InstrumentalModel?
++    private var stream: InstrumentalStreamBuffer?
 +    private var generation: UInt32 = 0
 +    private let activityLock = NSLock()
 +    private var foregroundEpoch: UInt?
 +    private var activityEpoch: UInt = 0
 +    private var activityObservers: [NSObjectProtocol] = []
 +
-+    func start(url: URL, computeMode: InstrumentalComputeMode, completion: @escaping (Bool) -> Void) {
++    func start(url: URL, mode: InstrumentalMode, computeMode: InstrumentalComputeMode, completion: @escaping (Bool) -> Void) {
 +        observeAppActivity()
 +        queue.async {
 +            do {
-+                let model = try HQ4InstrumentalModel(url: url, computeMode: computeMode)
++                let model = try InstrumentalModel(url: url, mode: mode, computeMode: computeMode,
++                                                  gpuEpoch: self.currentGPUEpoch())
 +                self.model = model
 +                self.generation = 0
-+                if !EeveeInstrumentalEnable() {
++                let enabled = mode == .melBand ? EeveeInstrumentalEnableMelBand() : EeveeInstrumentalEnable()
++                if !enabled {
 +                    self.model = nil
 +                    completion(false)
 +                    return
@@ -867,7 +952,7 @@ index 0000000..4223400
 +        let source = EeveeInstrumentalCurrentStream()
 +        guard source.generation != 0, let model = model else { return }
 +        if source.generation != generation {
-+            stream = HQ4Stream(sampleRate: Int(source.sampleRate))
++            stream = InstrumentalStreamBuffer(sampleRate: Int(source.sampleRate), window: model.window, hop: model.hop)
 +            generation = source.generation
 +        }
 +        let thermal = ProcessInfo.processInfo.thermalState
@@ -878,11 +963,12 @@ index 0000000..4223400
 +}
 +
 +@available(iOS 16.0, *)
-+private final class HQ4Stream {
++private final class InstrumentalStreamBuffer {
++    private let modelWindow: Int
 +    private let frameCount: Int
 +    private let hop: Int
-+    private let toModel: HQ4Resampler
-+    private let fromModel: HQ4Resampler
++    private let toModel: InstrumentalResampler
++    private let fromModel: InstrumentalResampler
 +    private var input: [EeveeStereoFrame]
 +    private var count = 0
 +    private var position: UInt64 = 0
@@ -890,12 +976,13 @@ index 0000000..4223400
 +    private var output: [EeveeStereoFrame] = []
 +    private var written = 0
 +
-+    init(sampleRate: Int) {
-+        let modelRate = HQ4InstrumentalModel.sampleRate
-+        frameCount = (HQ4InstrumentalModel.window * sampleRate + modelRate - 1) / modelRate
-+        hop = HQ4InstrumentalModel.hop * sampleRate / modelRate
-+        toModel = HQ4Resampler(from: sampleRate, to: modelRate)
-+        fromModel = HQ4Resampler(from: modelRate, to: sampleRate)
++    init(sampleRate: Int, window: Int, hop: Int) {
++        let modelRate = InstrumentalModel.sampleRate
++        modelWindow = window
++        frameCount = (window * sampleRate + modelRate - 1) / modelRate
++        self.hop = hop * sampleRate / modelRate
++        toModel = InstrumentalResampler(from: sampleRate, to: modelRate)
++        fromModel = InstrumentalResampler(from: modelRate, to: sampleRate)
 +        input = Array(repeating: EeveeStereoFrame(left: 0, right: 0), count: frameCount)
 +    }
 +
@@ -913,7 +1000,7 @@ index 0000000..4223400
 +
 +        let stems: [[Float]]?
 +        if useModel {
-+            let frames = toModel.convert(input, count: HQ4InstrumentalModel.window)
++            let frames = toModel.convert(input, count: modelWindow)
 +            stems = separate([frames.map(\.left), frames.map(\.right)])
 +        } else {
 +            stems = nil
@@ -959,7 +1046,7 @@ index 0000000..4223400
 +
 +// The two supported rates have a repeating rational phase. A windowed sinc
 +// filter avoids sending aliased high frequencies to the model at 48 kHz.
-+private struct HQ4Resampler {
++private struct InstrumentalResampler {
 +    private let numerator: Int
 +    private let denominator: Int
 +    private let kernels: [[Float]]
@@ -1042,10 +1129,10 @@ index cbd1c5b..df907b2 100644
  
 diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.m b/Sources/EeveeSpotifyC/LiveInstrumental.m
 new file mode 100644
-index 0000000..b0ecc25
+index 0000000..049780a
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/LiveInstrumental.m
-@@ -0,0 +1,263 @@
+@@ -0,0 +1,276 @@
 +#include "include/LiveInstrumental.h"
 +#include <AudioToolbox/AudioToolbox.h>
 +#include <dlfcn.h>
@@ -1056,7 +1143,8 @@ index 0000000..b0ecc25
 +
 +#define RING_SIZE (1u << 19)
 +#define RING_MASK (RING_SIZE - 1)
-+#define DELAY_SECONDS 8
++#define HQ4_DELAY_MS 8000u
++#define MEL_BAND_DELAY_MS 2750u
 +
 +typedef struct {
 +    EeveeStereoFrame frame;
@@ -1072,7 +1160,7 @@ index 0000000..b0ecc25
 +static WetFrame outputRing[RING_SIZE];
 +static _Atomic uint64_t inputWrite, inputRead, inputStart, outputWrite, outputRead;
 +static _Atomic uint32_t request, active, inputReady, rate, status;
-+typedef enum { EffectOff, EffectHQ4, EffectImmediate } EffectMode;
++typedef enum { EffectOff, EffectHQ4, EffectImmediate, EffectMelBand } EffectMode;
 +static _Atomic EffectMode effectMode;
 +static atomic_bool playing = true;
 +static atomic_bool appActive = true;
@@ -1086,6 +1174,14 @@ index 0000000..b0ecc25
 +static float centerGain;
 +static float centerLow, centerHigh, centerLowAlpha, centerHighAlpha;
 +static uint32_t renderGeneration, renderRate;
++
++static uint32_t effectDelayMs(EffectMode mode) {
++    switch (mode) {
++        case EffectHQ4: return HQ4_DELAY_MS;
++        case EffectMelBand: return MEL_BAND_DELAY_MS;
++        default: return 0;
++    }
++}
 +
 +static SetPCMCallback resolveObserver(void) {
 +    return (SetPCMCallback)dlsym(RTLD_DEFAULT, "SpotifyAudioProbeSetInstrumentalObserver");
@@ -1103,8 +1199,9 @@ index 0000000..b0ecc25
 +static void render(const void *identity, const AudioStreamBasicDescription *format,
 +                   AudioBufferList *buffers, UInt32 count) {
 +    const EffectMode mode = atomic_load_explicit(&effectMode, memory_order_acquire);
++    const uint32_t delayMs = effectDelayMs(mode);
 +    if (mode == EffectOff || !count ||
-+        (mode == EffectHQ4 && atomic_load_explicit(&appActive, memory_order_relaxed) &&
++        (delayMs != 0 && atomic_load_explicit(&appActive, memory_order_relaxed) &&
 +         !atomic_load_explicit(&playing, memory_order_relaxed))) return;
 +    if (atomic_flag_test_and_set_explicit(&rendering, memory_order_acquire)) return;
 +
@@ -1168,7 +1265,7 @@ index 0000000..b0ecc25
 +        goto done;
 +    }
 +    const uint64_t outputEnd = atomic_load_explicit(&outputWrite, memory_order_acquire);
-+    const uint64_t delay = (uint64_t)renderRate * DELAY_SECONDS;
++    const uint64_t delay = (uint64_t)renderRate * delayMs / 1000;
 +    uint32_t result = immediate ? 5 : position < delay ? 1 : 2;
 +    const unsigned stride = planar ? 1 : 2;
 +    void *left = buffers->mBuffers[0].mData;
@@ -1244,6 +1341,8 @@ index 0000000..b0ecc25
 +
 +bool EeveeInstrumentalEnable(void) { return enableEffect(EffectHQ4); }
 +
++bool EeveeInstrumentalEnableMelBand(void) { return enableEffect(EffectMelBand); }
++
 +bool EeveeInstrumentalEnableImmediate(void) { return enableEffect(EffectImmediate); }
 +
 +void EeveeInstrumentalDisable(void) {
@@ -1267,14 +1366,15 @@ index 0000000..b0ecc25
 +}
 +
 +uint32_t EeveeInstrumentalDelayMs(void) {
-+    if (atomic_load(&effectMode) != EffectHQ4 || atomic_load(&request) != atomic_load(&active)) return 0;
++    const uint32_t delay = effectDelayMs(atomic_load(&effectMode));
++    if (atomic_load(&request) != atomic_load(&active)) return 0;
 +    const uint32_t mode = atomic_load(&status);
-+    return mode >= 1 && mode <= 3 ? DELAY_SECONDS * 1000 : 0;
++    return mode >= 1 && mode <= 3 ? delay : 0;
 +}
 +
 +EeveeInstrumentalStream EeveeInstrumentalCurrentStream(void) {
 +    uint32_t generation = atomic_load_explicit(&active, memory_order_acquire);
-+    if (atomic_load(&effectMode) != EffectHQ4 || generation != atomic_load(&request)) return (EeveeInstrumentalStream){0, 0};
++    if (!effectDelayMs(atomic_load(&effectMode)) || generation != atomic_load(&request)) return (EeveeInstrumentalStream){0, 0};
 +    return (EeveeInstrumentalStream){generation, atomic_load(&rate)};
 +}
 +
@@ -1311,10 +1411,10 @@ index 0000000..b0ecc25
 +}
 diff --git a/Sources/EeveeSpotifyC/include/LiveInstrumental.h b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
 new file mode 100644
-index 0000000..9ad3ba7
+index 0000000..22123b3
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/include/LiveInstrumental.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,28 @@
 +#pragma once
 +#include <stdbool.h>
 +#include <stdint.h>
@@ -1331,6 +1431,7 @@ index 0000000..9ad3ba7
 +
 +bool EeveeInstrumentalAvailable(void);
 +bool EeveeInstrumentalEnable(void);
++bool EeveeInstrumentalEnableMelBand(void);
 +bool EeveeInstrumentalEnableImmediate(void);
 +void EeveeInstrumentalDisable(void);
 +void EeveeInstrumentalReset(void);
@@ -1344,10 +1445,10 @@ index 0000000..9ad3ba7
 +uint32_t EeveeInstrumentalStatus(void);
 diff --git a/Tests/LiveInstrumentalStream.c b/Tests/LiveInstrumentalStream.c
 new file mode 100644
-index 0000000..18138d4
+index 0000000..208e349
 --- /dev/null
 +++ b/Tests/LiveInstrumentalStream.c
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,131 @@
 +#include <assert.h>
 +#include <stdio.h>
 +#include "../Sources/EeveeSpotifyC/LiveInstrumental.m"
@@ -1418,6 +1519,23 @@ index 0000000..18138d4
 +    assert(EeveeInstrumentalRead(2, incoming, Frames) == Frames);
 +    assert(incoming[0].left == 0.6f);
 +
++    atomic_store(&effectMode, EffectMelBand);
++    EeveeInstrumentalReset();
++    play(0.7f);
++    stream = EeveeInstrumentalCurrentStream();
++    assert(stream.generation == 3 && stream.sampleRate == 48000);
++    assert(EeveeInstrumentalRead(stream.generation, incoming, Frames) == 0);
++    for (unsigned i = 0; i < 132000 / Frames; ++i) {
++        play(0.7f);
++        assert(samples[0] == 0);
++        assert(EeveeInstrumentalRead(stream.generation, incoming, Frames) == Frames);
++    }
++    assert(EeveeInstrumentalDelayMs() == 2750);
++    assert(EeveeInstrumentalWrite(stream.generation, instrumental, Frames, 0) == Frames);
++    play(0.7f);
++    assert(samples[0] == 0);
++    assert(samples[(Frames - 1) * 2] != 0);
++
 +    format.mSampleRate = 32000;
 +    play(0.4f);
 +    assert(samples[0] == 0.4f && EeveeInstrumentalStatus() == 4);
@@ -1464,10 +1582,10 @@ index 0000000..18138d4
 +}
 diff --git a/Tools/LiveInstrumental.md b/Tools/LiveInstrumental.md
 new file mode 100644
-index 0000000..dc36bcc
+index 0000000..c3e96d2
 --- /dev/null
 +++ b/Tools/LiveInstrumental.md
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,25 @@
 +# 播放去人聲
 +
 +在「正在播放」畫面中，播放控制下方的麥克風圖示也能切換去人聲。這個按鈕與設定頁共用目前的模式和開關狀態。
@@ -1485,6 +1603,14 @@ index 0000000..dc36bcc
 +| 僅 CPU | 用 CPU 執行 AI 推論 | 持續用 CPU 執行 AI 推論 |
 +| GPU 優先 | 允許 Core ML 使用 GPU，部分運算仍可能由 CPU 執行 | 暫時使用中央人聲抑制 |
 +| CPU＋GPU（預設） | 允許 Core ML 使用 CPU 與 GPU，加速推論失敗時以純 CPU 重試 | 用 CPU 繼續 AI 去人聲 |
++
++## Mel-Band RoFormer Core ML（2 秒）
++
++在 iOS 18 以上的「播放去人聲」設定選擇 Mel-Band RoFormer。每次推論使用 2 秒的立體聲音訊，視窗每 1.5 秒向前移動，重疊區交叉淡化。播放緩衝為 2.75 秒，歌詞時間會依實際緩衝偏移。模型暫時未完成推論時，會使用中央人聲抑制。需要無額外緩衝時，可選擇原本的即時模式。
++
++使用 Build IPA (PATCHED) 的 Mel-Band RoFormer 選項時，IPA 同時保留 HQ 4 模型。若要手動匯入，選擇 Mel-Band RoFormer 後匯入 MelBandRoFormer2s.mlpackage。Core ML 以 CPU 或 CPU＋GPU 執行。GPU 優先與混合模式會依前景狀態切換，混合模式在背景使用 CPU。
++
++模型權重為 Kimberley Jensen 的 Mel-Band RoFormer Vocal。Core ML 匯出使用 Daisuke Majima 的 BSD-3-Clause 頻譜分離核心。
 diff --git a/Tools/prepare-hq4-model.py b/Tools/prepare-hq4-model.py
 new file mode 100644
 index 0000000..12f6416
@@ -1604,11 +1730,15 @@ diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Loc
 index 7bfc293..a2a51fa 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/en.lproj/Localizable.strings	
-@@ -518,3 +518,31 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
+@@ -518,3 +518,35 @@ lyrics_source_restart_popup = "Restart Spotify so the new lyrics source is used
  restart_later = "Later";
  manage_downloads = "Manage downloads";
  manage_downloads_subtitle = "Pixie offline downloads";
 +
++"instrumental_mode_melBand" = "Mel-Band RoFormer · 2-second window";
++"instrumental_melBand_help" = "Processes streamed playback with a 2-second AI window and 2.75 seconds of playback buffering. Center reduction fills in when AI falls behind.";
++"instrumental_melBand_needs_model" = "Import the 2-second MelBandRoFormer2s.mlpackage to use this mode.";
++"instrumental_melBand_model_error" = "Could not load the 2-second Mel-Band RoFormer model.";
 +"instrumental_title" = "Live Vocal Reduction";
 +"instrumental_mode" = "Mode";
 +"instrumental_mode_immediate" = "Immediate vocal reduction";
@@ -1640,11 +1770,15 @@ diff --git a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/
 index 6309ef0..3af3ba1 100644
 --- a/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
 +++ b/layout/Library/Application Support/EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings	
-@@ -516,3 +516,31 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
+@@ -516,3 +516,35 @@ spicylyrics_api_key_placeholder = "輸入 Spicy 用戶端金鑰";
  glass_lyrics_view = "自定義歌詞檢視";
  lyrics_source_restart_popup = "請重新啟動 Spotify，讓新的歌詞來源在所有位置生效。在此之前，已播放過的歌曲會保留舊歌詞。";
  restart_later = "稍後";
 +
++"instrumental_mode_melBand" = "Mel-Band RoFormer・2 秒視窗";
++"instrumental_melBand_help" = "使用 2 秒視窗逐段處理播放音訊，播放緩衝為 2.75 秒。AI 暫時跟不上時會使用中央人聲抑制。";
++"instrumental_melBand_needs_model" = "請匯入 2 秒版 MelBandRoFormer2s.mlpackage。";
++"instrumental_melBand_model_error" = "無法載入 2 秒版 Mel-Band RoFormer 模型。";
 +"instrumental_title" = "播放去人聲";
 +"instrumental_mode" = "處理模式";
 +"instrumental_mode_immediate" = "即時人聲抑制";
@@ -1672,3 +1806,154 @@ index 6309ef0..3af3ba1 100644
 +"instrumental_model_error" = "無法載入 HQ 4 Core ML 模型。";
 +"instrumental_switch_on" = "開啟";
 +"instrumental_switch_off" = "關閉";
+diff --git a/Tools/prepare-mel-band-roformer.py b/Tools/prepare-mel-band-roformer.py
+new file mode 100644
+index 0000000..b66f701
+--- /dev/null
++++ b/Tools/prepare-mel-band-roformer.py
+@@ -0,0 +1,145 @@
++"""Export the 2-second Kimberley Jensen vocal separator for Core ML."""
++
++import argparse
++import copy
++from pathlib import Path
++import sys
++import tempfile
++import time
++from urllib.request import urlretrieve
++
++import coremltools as ct
++from huggingface_hub import hf_hub_download
++import numpy as np
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++FFT = 2048
++HOP = 441
++SAMPLES = 88_200
++BINS = FFT // 2 + 1
++FRAMES = SAMPLES // HOP + 1
++SHAPE = (1, 4, BINS, FRAMES)
++KIM_REF = "25f44ffb55ee3c301281bba21b2d6d311cb69ae2"
++ZOO_REF = "e70996c531ad7d58b5cd7218b703d5b369cb34d0"
++
++
++class FixedRotary(nn.Module):
++    def __init__(self, rotary, length):
++        super().__init__()
++        angles = rotary(torch.arange(length)).detach().float()
++        self.register_buffer("cosine", angles.cos(), persistent=False)
++        self.register_buffer("sine", angles.sin(), persistent=False)
++
++    def rotate_queries_or_keys(self, tensor):
++        pairs = tensor.reshape(*tensor.shape[:-1], -1, 2)
++        perpendicular = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1)
++        return tensor * self.cosine + perpendicular.reshape_as(tensor) * self.sine
++
++
++class StereoSpectrogram(nn.Module):
++    def __init__(self, separator):
++        super().__init__()
++        self.separator = separator
++
++    def forward(self, spectrum):
++        # Host planes are L.real, L.imag, R.real and R.imag.
++        paired = spectrum.reshape(1, 2, 2, BINS, FRAMES)
++        interleaved = paired.permute(0, 3, 1, 4, 2).reshape(1, 2 * BINS, FRAMES, 2)
++        vocals = self.separator(interleaved)
++        return vocals.reshape(1, BINS, 2, FRAMES, 2).permute(0, 2, 4, 1, 3).reshape(SHAPE)
++
++
++def reference_model(work):
++    package = work / "models" / "mel_band_roformer"
++    package.mkdir(parents=True)
++    (package.parent / "__init__.py").touch()
++    root = f"https://raw.githubusercontent.com/KimberleyJensen/Mel-Band-Roformer-Vocal-Model/{KIM_REF}"
++    for name in ("__init__.py", "attend.py", "mel_band_roformer.py"):
++        urlretrieve(f"{root}/models/mel_band_roformer/{name}", package / name)
++    zoo = f"https://raw.githubusercontent.com/john-rocky/coreai-model-zoo/{ZOO_REF}"
++    urlretrieve(f"{zoo}/conversion/melband_roformer/export_core.py", work / "export_core.py")
++
++    sys.path.insert(0, str(work))
++    from export_core import SepCore
++    from models.mel_band_roformer import attend
++    from models.mel_band_roformer.mel_band_roformer import MelBandRoformer
++
++    attend.Attend.flash_attn = lambda self, query, key, value: F.scaled_dot_product_attention(query, key, value)
++    reference = MelBandRoformer(
++        dim=384, depth=6, stereo=True, num_stems=1, time_transformer_depth=1,
++        freq_transformer_depth=1, num_bands=60, dim_head=64, heads=8, attn_dropout=0,
++        ff_dropout=0, flash_attn=True, dim_freqs_in=BINS, sample_rate=44_100,
++        stft_n_fft=FFT, stft_hop_length=HOP, stft_win_length=FFT,
++        stft_normalized=False, mask_estimator_depth=2,
++    ).eval()
++    checkpoint = hf_hub_download(
++        "KimberleyJSN/melbandroformer", "MelBandRoformer.ckpt",
++        revision="ac9b0614ab3cd7f77219e18ba494dfd93956c348",
++    )
++    reference.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
++    return reference, SepCore
++
++
++def to_audio(planes):
++    packed = planes.float().reshape(2, 2, BINS, FRAMES).permute(0, 2, 3, 1).contiguous()
++    return torch.istft(torch.view_as_complex(packed), FFT, HOP, window=torch.hann_window(FFT), length=SAMPLES)
++
++
++def verify(output, expected, minimum, label):
++    if not torch.isfinite(output).all():
++        raise ValueError(f"{label} produced non-finite samples")
++    score = F.cosine_similarity(output.flatten(), expected.flatten(), dim=0).item()
++    if not np.isfinite(score) or score < minimum:
++        raise ValueError(f"{label} cosine {score:.6f}, expected at least {minimum}")
++    print(f"{label} cosine {score:.6f}", flush=True)
++
++
++def export(destination):
++    with tempfile.TemporaryDirectory() as directory, torch.no_grad():
++        reference, make_core = reference_model(Path(directory))
++        sample = hf_hub_download(
++            "TrevorJS/MelBandRoformer-Vocal-CoreML", "golden_raw.f32",
++            revision="498dbf1b3c800a72be07ab0b15ed37f9d2b2bb05",
++        )
++        audio = torch.from_numpy(np.fromfile(sample, dtype=np.float32).reshape(2, 352_800)[:, :SAMPLES].copy())
++        expected = reference(audio.unsqueeze(0))[0]
++        stft = torch.stft(audio, FFT, HOP, window=torch.hann_window(FFT), return_complex=True)
++        planes = torch.view_as_real(stft).permute(0, 3, 1, 2).reshape(SHAPE).contiguous()
++
++        separator = make_core(copy.deepcopy(reference))
++        for time_transformer, frequency_transformer in separator.layers:
++            for transformer, length in ((time_transformer, FRAMES), (frequency_transformer, 60)):
++                for attention, _ in transformer.layers:
++                    attention.rotary_embed = FixedRotary(attention.rotary_embed, length)
++        wrapped = StereoSpectrogram(separator).eval()
++        verify(to_audio(wrapped(planes)), expected, 0.9999, "Export graph")
++        traced = torch.jit.trace(wrapped, planes, check_trace=False)
++
++        model = ct.convert(
++            traced,
++            inputs=[ct.TensorType(name="input", shape=SHAPE, dtype=np.float16)],
++            outputs=[ct.TensorType(name="output", dtype=np.float16)],
++            minimum_deployment_target=ct.target.iOS18,
++            compute_precision=ct.precision.FLOAT16,
++            convert_to="mlprogram",
++            skip_model_load=True,
++        )
++        model.short_description = "Kimberley Jensen Mel-Band RoFormer vocals, 2 s at 44.1 kHz"
++        model.license = "MIT"
++        model.save(str(destination))
++
++        for units in (ct.ComputeUnit.CPU_ONLY, ct.ComputeUnit.CPU_AND_GPU):
++            runtime = ct.models.MLModel(str(destination), compute_units=units)
++            start = time.monotonic()
++            result = runtime.predict({"input": planes.numpy().astype(np.float16)})["output"]
++            verify(to_audio(torch.from_numpy(result)), expected, 0.999, units.name)
++            print(f"{units.name} first prediction in {time.monotonic() - start:.2f} s", flush=True)
++            del runtime
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("output", type=Path)
++    export(parser.parse_args().output)
