@@ -52,10 +52,10 @@ index b8971ae..9fa8acc 100644
      bool backendReady;
 diff --git a/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
 new file mode 100644
-index 0000000..72a74c4
+index 0000000..1c4bbf6
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/HQ4InstrumentalModel.swift
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,326 @@
 +import Accelerate
 +import CoreML
 +
@@ -88,7 +88,8 @@ index 0000000..72a74c4
 +        separatesVocals = mode == .melBand
 +        if separatesVocals {
 +            spectrum = try Spectrogram(size: 2_048, bins: 1_025, hop: 441, frames: 201, outputGain: 1)
-+            hop = 66_150
++            // 1.8 seconds of new audio, with 200 ms of overlap.
++            hop = 79_380
 +            cpuModel = nil
 +            let useGPU = computeMode != .cpuOnly && gpuEpoch != nil
 +            do {
@@ -107,6 +108,19 @@ index 0000000..72a74c4
 +        } else {
 +            cpuModel = try SpectrogramCoreML(url: url, bins: spectrum.bins, frames: spectrum.frames,
 +                                            computeUnits: .cpuOnly)
++        }
++    }
++
++    func prepareForPlayback(gpuEpoch: () -> UInt?) throws {
++        guard separatesVocals else { return }
++        let epoch = computeMode == .cpuOnly ? nil : gpuEpoch()
++        guard computeMode != .gpuPreferred || epoch != nil else { return }
++        // Pay Core ML's first-inference setup cost before starting the playback clock.
++        let silence = Array(repeating: Float.zero, count: 4 * spectrum.bins * spectrum.frames)
++        do {
++            _ = try predictRoFormer(silence, epoch: epoch, gpuEpoch: gpuEpoch)
++        } catch InstrumentalError.gpuUnavailable {
++            // The app may have left the foreground during preparation.
 +        }
 +    }
 +
@@ -848,10 +862,10 @@ index 0000000..8e339c2
 +}
 diff --git a/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
 new file mode 100644
-index 0000000..c301004
+index 0000000..5385ff9
 --- /dev/null
 +++ b/Sources/EeveeSpotify/Karaoke/LiveInstrumentalWorker.swift
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,230 @@
 +import EeveeSpotifyC
 +import Foundation
 +import UIKit
@@ -874,6 +888,7 @@ index 0000000..c301004
 +            do {
 +                let model = try InstrumentalModel(url: url, mode: mode, computeMode: computeMode,
 +                                                  gpuEpoch: self.currentGPUEpoch())
++                try model.prepareForPlayback(gpuEpoch: self.currentGPUEpoch)
 +                self.model = model
 +                self.generation = 0
 +                let enabled = mode == .melBand ? EeveeInstrumentalEnableMelBand() : EeveeInstrumentalEnable()
@@ -1005,26 +1020,20 @@ index 0000000..c301004
 +        } else {
 +            stems = nil
 +        }
++        let overlap = frameCount - hop
 +        if let stems {
 +            let wet = zip(stems[0], stems[1]).map { EeveeStereoFrame(left: $0.0, right: $0.1) }
 +            output = fromModel.convert(wet, count: frameCount)
-+        } else {
-+            output = input
-+        }
-+
-+        let overlap = frameCount - hop
-+        for i in pending.indices {
-+            let mix = Float(i + 1) / Float(overlap + 1)
-+            output[i].left = pending[i].left * (1 - mix) + output[i].left * mix
-+            output[i].right = pending[i].right * (1 - mix) + output[i].right * mix
-+        }
-+        if stems != nil {
++            for i in pending.indices {
++                let mix = Float(i + 1) / Float(overlap + 1)
++                output[i].left = pending[i].left * (1 - mix) + output[i].left * mix
++                output[i].right = pending[i].right * (1 - mix) + output[i].right * mix
++            }
 +            pending = Array(output[hop...])
 +            output.removeLast(overlap)
 +        } else {
-+            // Leave this range empty so the render thread uses center attenuation.
-+            // Keep the overlapping original frames for a clean return to the model.
-+            pending = Array(input[hop...])
++            // Crossfades between model windows may only use separated audio.
++            pending.removeAll(keepingCapacity: true)
 +            output.removeAll(keepingCapacity: true)
 +        }
 +        input.replaceSubrange(0..<overlap, with: Array(input[hop...]))
@@ -1129,10 +1138,10 @@ index cbd1c5b..df907b2 100644
  
 diff --git a/Sources/EeveeSpotifyC/LiveInstrumental.m b/Sources/EeveeSpotifyC/LiveInstrumental.m
 new file mode 100644
-index 0000000..049780a
+index 0000000..037166e
 --- /dev/null
 +++ b/Sources/EeveeSpotifyC/LiveInstrumental.m
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,300 @@
 +#include "include/LiveInstrumental.h"
 +#include <AudioToolbox/AudioToolbox.h>
 +#include <dlfcn.h>
@@ -1144,7 +1153,9 @@ index 0000000..049780a
 +#define RING_SIZE (1u << 19)
 +#define RING_MASK (RING_SIZE - 1)
 +#define HQ4_DELAY_MS 8000u
-+#define MEL_BAND_DELAY_MS 2750u
++#define MEL_BAND_DELAY_MS 5500u
++#define TRANSITION_MS 20u
++#define RECOVERY_MS 350u
 +
 +typedef struct {
 +    EeveeStereoFrame frame;
@@ -1170,7 +1181,8 @@ index 0000000..049780a
 +static const void *source;
 +static uint64_t sourceTime, position;
 +static _Atomic uint64_t switchAfterTicks;
-+static float wetGain;
++static uint32_t wetFade;
++static bool wetPlaying;
 +static float centerGain;
 +static float centerLow, centerHigh, centerLowAlpha, centerHighAlpha;
 +static uint32_t renderGeneration, renderRate;
@@ -1194,6 +1206,14 @@ index 0000000..049780a
 +    centerGain = fminf(1, centerGain + 1.0f / 256);
 +    const float reduction = (centerHigh - centerLow) * centerGain;
 +    return (EeveeStereoFrame){frame.left - reduction, frame.right - reduction};
++}
++
++// The producer writes positions in increasing order. Matching both endpoints
++// proves this span has no missing or stale frames.
++static bool hasWetSpan(uint64_t read, uint64_t end, const WetFrame *first, uint32_t count) {
++    if (end - read < count) return false;
++    const WetFrame *last = &outputRing[(read + count - 1) & RING_MASK];
++    return last->generation == first->generation && last->position == first->position + count - 1;
 +}
 +
 +static void render(const void *identity, const AudioStreamBasicDescription *format,
@@ -1242,7 +1262,9 @@ index 0000000..049780a
 +        renderGeneration = generation;
 +        renderRate = (uint32_t)format->mSampleRate;
 +        position = 0;
-+        wetGain = centerGain = 0;
++        wetFade = 0;
++        wetPlaying = false;
++        centerGain = 0;
 +        centerLow = centerHigh = 0;
 +        centerLowAlpha = 1 - expf(-6.2831853f * 160 / renderRate);
 +        centerHighAlpha = 1 - expf(-6.2831853f * 7000 / renderRate);
@@ -1266,7 +1288,9 @@ index 0000000..049780a
 +    }
 +    const uint64_t outputEnd = atomic_load_explicit(&outputWrite, memory_order_acquire);
 +    const uint64_t delay = (uint64_t)renderRate * delayMs / 1000;
-+    uint32_t result = immediate ? 5 : position < delay ? 1 : 2;
++    const uint32_t fadeFrames = renderRate * TRANSITION_MS / 1000;
++    const uint32_t recoveryFrames = renderRate * RECOVERY_MS / 1000;
++    uint32_t result = immediate ? 5 : 1;
 +    const unsigned stride = planar ? 1 : 2;
 +    void *left = buffers->mBuffers[0].mData;
 +    void *right = planar ? buffers->mBuffers[1].mData : left;
@@ -1295,15 +1319,24 @@ index 0000000..049780a
 +                    continue;
 +                }
 +                if (wet->position == due) {
-+                    wetGain = fminf(1, wetGain + 1.0f / 256);
-+                    output.left += (wet->frame.left - output.left) * wetGain;
-+                    output.right += (wet->frame.right - output.right) * wetGain;
++                    if (wetPlaying && !hasWetSpan(read, outputEnd, wet, fadeFrames + 1)) {
++                        wetPlaying = false;
++                    } else if (!wetPlaying && hasWetSpan(read, outputEnd, wet, recoveryFrames)) {
++                        wetPlaying = true;
++                    }
++                    if (wetPlaying && wetFade < fadeFrames) ++wetFade;
++                    else if (!wetPlaying && wetFade > 0) --wetFade;
++                    const float gain = (float)wetFade / fadeFrames;
++                    output.left += (wet->frame.left - output.left) * gain;
++                    output.right += (wet->frame.right - output.right) * gain;
 +                    ++read;
++                    result = wetPlaying || wetFade ? 2 : 3;
 +                    goto writeOutput;
 +                }
 +                break;
 +            }
-+            wetGain = 0;
++            wetFade = 0;
++            wetPlaying = false;
 +            result = 3;
 +        }
 +writeOutput:
@@ -1445,17 +1478,17 @@ index 0000000..22123b3
 +uint32_t EeveeInstrumentalStatus(void);
 diff --git a/Tests/LiveInstrumentalStream.c b/Tests/LiveInstrumentalStream.c
 new file mode 100644
-index 0000000..208e349
+index 0000000..1abde39
 --- /dev/null
 +++ b/Tests/LiveInstrumentalStream.c
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,151 @@
 +#include <assert.h>
 +#include <stdio.h>
 +#include "../Sources/EeveeSpotifyC/LiveInstrumental.m"
 +
 +enum { Frames = 256 };
 +static float samples[Frames * 2];
-+static EeveeStereoFrame incoming[Frames], instrumental[Frames];
++static EeveeStereoFrame incoming[Frames], instrumental[48000];
 +static const int unit;
 +static AudioStreamBasicDescription format = {
 +    .mSampleRate = 48000, .mFormatID = kAudioFormatLinearPCM,
@@ -1474,7 +1507,7 @@ index 0000000..208e349
 +int main(void) {
 +    atomic_store(&request, 1);
 +    atomic_store(&effectMode, EffectHQ4);
-+    for (unsigned i = 0; i < Frames; ++i) instrumental[i] = (EeveeStereoFrame){0.25f, 0.3f};
++    for (unsigned i = 0; i < 48000; ++i) instrumental[i] = (EeveeStereoFrame){0.25f, 0.3f};
 +
 +    play(0.5f);
 +    assert(samples[0] == 0.5f);
@@ -1485,7 +1518,9 @@ index 0000000..208e349
 +    assert(samples[0] == 0 && EeveeInstrumentalDelayMs() == 8000);
 +    assert(EeveeInstrumentalRead(1, incoming, Frames) == Frames);
 +    assert(incoming[0].left == 0.5f && incoming[0].right == 0.5f);
-+    assert(EeveeInstrumentalWrite(1, instrumental, Frames, 0) == Frames);
++    const unsigned wetCount = 48 * RECOVERY_MS;
++    const unsigned fadeCount = 48 * TRANSITION_MS;
++    assert(EeveeInstrumentalWrite(1, instrumental, wetCount, 0) == wetCount);
 +
 +    for (unsigned i = 1; i < 48000 * 8 / Frames; ++i) {
 +        play(0.8f);
@@ -1500,11 +1535,29 @@ index 0000000..208e349
 +    // if the audio unit is still rendering.
 +    EeveeInstrumentalSetAppActive(false);
 +    play(0.9f);
-+    assert(samples[(Frames - 1) * 2] == 0.25f);
-+    assert(fabsf(samples[Frames * 2 - 1] - 0.3f) < 0.00001f);
 +    assert(EeveeInstrumentalStatus() == 2);
++    for (unsigned i = Frames; i < wetCount - fadeCount; i += Frames) play(0.9f);
++    assert(fabsf(samples[0] - 0.25f) < 0.00001f);
++    assert(fabsf(samples[1] - 0.30f) < 0.00001f);
++
++    float previous = samples[(Frames - 1) * 2];
++    while (position < 48000 * 8 + wetCount + Frames) {
++        play(0.9f);
++        for (unsigned i = 0; i < Frames; ++i) {
++            assert(fabsf(samples[2 * i] - previous) < 0.01f);
++            previous = samples[2 * i];
++        }
++    }
++    assert(EeveeInstrumentalStatus() == 3);
++
++    // A brief island of valid AI audio must not cause another switch.
++    const uint64_t due = position - 48000 * 8;
++    assert(EeveeInstrumentalWrite(1, instrumental, Frames, due) == Frames);
 +    play(0.9f);
-+    assert(samples[0] < 0.79f && EeveeInstrumentalStatus() == 3);
++    assert(EeveeInstrumentalStatus() == 3 && wetFade == 0);
++    assert(EeveeInstrumentalWrite(1, instrumental, wetCount, due + Frames) == wetCount);
++    play(0.9f);
++    assert(EeveeInstrumentalStatus() == 2 && wetFade == Frames);
 +    assert(EeveeInstrumentalDelayMs() == 8000);
 +    EeveeInstrumentalSetPlaying(true);
 +    EeveeInstrumentalSetAppActive(true);
@@ -1525,13 +1578,13 @@ index 0000000..208e349
 +    stream = EeveeInstrumentalCurrentStream();
 +    assert(stream.generation == 3 && stream.sampleRate == 48000);
 +    assert(EeveeInstrumentalRead(stream.generation, incoming, Frames) == 0);
-+    for (unsigned i = 0; i < 132000 / Frames; ++i) {
++    for (unsigned i = 0; i < 264000 / Frames; ++i) {
 +        play(0.7f);
 +        assert(samples[0] == 0);
 +        assert(EeveeInstrumentalRead(stream.generation, incoming, Frames) == Frames);
 +    }
-+    assert(EeveeInstrumentalDelayMs() == 2750);
-+    assert(EeveeInstrumentalWrite(stream.generation, instrumental, Frames, 0) == Frames);
++    assert(EeveeInstrumentalDelayMs() == 5500);
++    assert(EeveeInstrumentalWrite(stream.generation, instrumental, wetCount, 0) == wetCount);
 +    play(0.7f);
 +    assert(samples[0] == 0);
 +    assert(samples[(Frames - 1) * 2] != 0);
@@ -1578,11 +1631,11 @@ index 0000000..208e349
 +    EeveeInstrumentalDisable();
 +    play(0.6f);
 +    assert(samples[0] == 0.6f);
-+    puts("PASS: buffered playback, immediate vocal-band attenuation, stereo preservation and bypass");
++    puts("PASS: buffered playback, smooth fallback and recovery, immediate mode and bypass");
 +}
 diff --git a/Tools/LiveInstrumental.md b/Tools/LiveInstrumental.md
 new file mode 100644
-index 0000000..c3e96d2
+index 0000000..5ee5d73
 --- /dev/null
 +++ b/Tools/LiveInstrumental.md
 @@ -0,0 +1,25 @@
@@ -1606,7 +1659,7 @@ index 0000000..c3e96d2
 +
 +## Mel-Band RoFormer Core ML（2 秒）
 +
-+在 iOS 18 以上的「播放去人聲」設定選擇 Mel-Band RoFormer。每次推論使用 2 秒的立體聲音訊，視窗每 1.5 秒向前移動，重疊區交叉淡化。播放緩衝為 2.75 秒，歌詞時間會依實際緩衝偏移。模型暫時未完成推論時，會使用中央人聲抑制。需要無額外緩衝時，可選擇原本的即時模式。
++在 iOS 18 以上的「播放去人聲」設定選擇 Mel-Band RoFormer。每次推論使用 2 秒的立體聲音訊，視窗每 1.8 秒向前移動，重疊區交叉淡化。播放緩衝為 5.5 秒，歌詞時間會依實際緩衝偏移。啟用時先預熱模型。推論暫時跟不上時會淡入中央人聲抑制，等累積至少 350 毫秒連續 AI 伴奏後再淡回。需要無額外緩衝時，可選擇原本的即時模式。
 +
 +使用 Build IPA (PATCHED) 的 Mel-Band RoFormer 選項時，IPA 同時保留 HQ 4 模型。若要手動匯入，選擇 Mel-Band RoFormer 後匯入 MelBandRoFormer2s.mlpackage。Core ML 以 CPU 或 CPU＋GPU 執行。GPU 優先與混合模式會依前景狀態切換，混合模式在背景使用 CPU。
 +
@@ -1736,7 +1789,7 @@ index 7bfc293..a2a51fa 100644
  manage_downloads_subtitle = "Pixie offline downloads";
 +
 +"instrumental_mode_melBand" = "Mel-Band RoFormer · 2-second window";
-+"instrumental_melBand_help" = "Processes streamed playback with a 2-second AI window and 2.75 seconds of playback buffering. Center reduction fills in when AI falls behind.";
++"instrumental_melBand_help" = "Processes playback with a 2-second AI window and a 5.5-second playback buffer. If the AI cannot keep up, the app fades into vocal reduction until sufficient AI audio is ready.";
 +"instrumental_melBand_needs_model" = "Import the 2-second MelBandRoFormer2s.mlpackage to use this mode.";
 +"instrumental_melBand_model_error" = "Could not load the 2-second Mel-Band RoFormer model.";
 +"instrumental_title" = "Live Vocal Reduction";
@@ -1776,7 +1829,7 @@ index 6309ef0..3af3ba1 100644
  restart_later = "稍後";
 +
 +"instrumental_mode_melBand" = "Mel-Band RoFormer・2 秒視窗";
-+"instrumental_melBand_help" = "使用 2 秒視窗逐段處理播放音訊，播放緩衝為 2.75 秒。AI 暫時跟不上時會使用中央人聲抑制。";
++"instrumental_melBand_help" = "使用 2 秒視窗逐段處理，播放緩衝為 5.5 秒。AI 跟不上時會淡入中央人聲抑制，等伴奏累積足夠後再淡回。";
 +"instrumental_melBand_needs_model" = "請匯入 2 秒版 MelBandRoFormer2s.mlpackage。";
 +"instrumental_melBand_model_error" = "無法載入 2 秒版 Mel-Band RoFormer 模型。";
 +"instrumental_title" = "播放去人聲";
