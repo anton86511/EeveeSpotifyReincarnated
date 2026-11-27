@@ -38,7 +38,7 @@ env:
 
 jobs:
   mel-band-model:
-    if: ${{ inputs.ipa_url != '' && inputs.mel_band_roformer }}
+    if: ${{ inputs.mel_band_roformer }}
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -55,7 +55,11 @@ jobs:
           python Tools/prepare-mel-band-roformer.py "$RUNNER_TEMP/MelBandRoFormer2s.mlpackage"
           xcrun --sdk iphoneos coremlcompiler compile "$RUNNER_TEMP/MelBandRoFormer2s.mlpackage" "$RUNNER_TEMP"
           test -s "$RUNNER_TEMP/MelBandRoFormer2s.mlmodelc/weights/weight.bin"
-          tar -cf "$RUNNER_TEMP/MelBandRoFormer2s.tar" -C "$RUNNER_TEMP" MelBandRoFormer2s.mlmodelc
+          curl --fail --silent --show-error --location \
+            'https://raw.githubusercontent.com/john-rocky/coreai-model-zoo/e70996c531ad7d58b5cd7218b703d5b369cb34d0/LICENSE' \
+            -o "$RUNNER_TEMP/MelBandRoFormer-LICENSE.txt"
+          tar -cf "$RUNNER_TEMP/MelBandRoFormer2s.tar" -C "$RUNNER_TEMP" \
+            MelBandRoFormer2s.mlmodelc MelBandRoFormer-LICENSE.txt
       - uses: actions/upload-artifact@v4
         with:
           name: RoFormer-model
@@ -261,7 +265,8 @@ jobs:
           tar -xf "$model_dir/MelBandRoFormer2s.tar" -C "$model_dir/$app"
           test -s "$model_dir/$app/MelBandRoFormer2s.mlmodelc/weights/weight.bin"
           ipa_path="$PWD/$OUT_IPA"
-          (cd "$model_dir" && zip -qry "$ipa_path" "$app/MelBandRoFormer2s.mlmodelc")
+          (cd "$model_dir" && zip -qry "$ipa_path" \
+            "$app/MelBandRoFormer2s.mlmodelc" "$app/MelBandRoFormer-LICENSE.txt")
           unzip -tq "$OUT_IPA"
 
       - name: Inject OpeninSafariSpotify extension into IPA PlugIns
