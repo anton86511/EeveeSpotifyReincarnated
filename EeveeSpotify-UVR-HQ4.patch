@@ -1808,10 +1808,10 @@ index 6309ef0..3af3ba1 100644
 +"instrumental_switch_off" = "關閉";
 diff --git a/Tools/prepare-mel-band-roformer.py b/Tools/prepare-mel-band-roformer.py
 new file mode 100644
-index 0000000..b66f701
+index 0000000..939dc7a
 --- /dev/null
 +++ b/Tools/prepare-mel-band-roformer.py
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,150 @@
 +"""Export the 2-second Kimberley Jensen vocal separator for Core ML."""
 +
 +import argparse
@@ -1904,7 +1904,7 @@ index 0000000..b66f701
 +def verify(output, expected, minimum, label):
 +    if not torch.isfinite(output).all():
 +        raise ValueError(f"{label} produced non-finite samples")
-+    score = F.cosine_similarity(output.flatten(), expected.flatten(), dim=0).item()
++    score = F.cosine_similarity(output.flatten().double(), expected.flatten().double(), dim=0).item()
 +    if not np.isfinite(score) or score < minimum:
 +        raise ValueError(f"{label} cosine {score:.6f}, expected at least {minimum}")
 +    print(f"{label} cosine {score:.6f}", flush=True)
@@ -1936,7 +1936,11 @@ index 0000000..b66f701
 +            inputs=[ct.TensorType(name="input", shape=SHAPE, dtype=np.float16)],
 +            outputs=[ct.TensorType(name="output", dtype=np.float16)],
 +            minimum_deployment_target=ct.target.iOS18,
-+            compute_precision=ct.precision.FLOAT16,
++            # Keep attention, normalization and residual paths in float32.
++            # The dense weight matrices still use float16 to limit package size.
++            compute_precision=ct.transform.FP16ComputePrecision(
++                op_selector=lambda op: op.op_type in {"linear", "matmul", "einsum"},
++            ),
 +            convert_to="mlprogram",
 +            skip_model_load=True,
 +        )
@@ -1948,8 +1952,9 @@ index 0000000..b66f701
 +            runtime = ct.models.MLModel(str(destination), compute_units=units)
 +            start = time.monotonic()
 +            result = runtime.predict({"input": planes.numpy().astype(np.float16)})["output"]
++            elapsed = time.monotonic() - start
 +            verify(to_audio(torch.from_numpy(result)), expected, 0.999, units.name)
-+            print(f"{units.name} first prediction in {time.monotonic() - start:.2f} s", flush=True)
++            print(f"{units.name} first prediction in {elapsed:.2f} s", flush=True)
 +            del runtime
 +
 +
